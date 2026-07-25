@@ -6,21 +6,27 @@ import hmac
 import hashlib
 import requests
 import math
+import threading
 from groq import Groq
 from datetime import datetime
 
 # ==========================================
-# 1. STATIC API KEYS (DANGER: KEEP THIS FILE SECRET)
+# 1. SECURE API KEYS (From Streamlit Secrets)
 # ==========================================
-API_KEY = "56b76b4c2ea66bb454198a7a607577e1d98c74944602eec8"
-API_SECRET = "e3d5de48f74758a9095fca952b7f8b13c28b0bf3de99c671de5db4af700d52d3"
-GROQ_API_KEY = "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"
+try:
+    API_KEY = st.secrets["COINDCX_API_KEY"]
+    API_SECRET = st.secrets["COINDCX_API_SECRET"]
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    API_KEY = "YOUR_COINDCX_API_KEY_HERE"
+    API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
+    GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
 # ==========================================
 # 2. HELPER FUNCTIONS
 # ==========================================
 def coindcx_auth_post(endpoint, body):
-    """Signs and sends authenticated requests to the CoinDCX API."""
+    """Signs and sends authenticated requests to CoinDCX."""
     url = f"https://api.coindcx.com{endpoint}"
     secret_bytes = bytes(API_SECRET, 'utf-8')
     json_body = json.dumps(body, separators=(',', ':'))
@@ -33,107 +39,92 @@ def coindcx_auth_post(endpoint, body):
     }
     return requests.post(url, data=json_body, headers=headers).json()
 
-def log_trade(action, crypto_amt, inr_budget, reason, status):
-    log_entry = {
-        "Time": datetime.now().strftime("%I:%M:%S %p"),
-        "Action": action,
-        "Quantity": crypto_amt,
-        "Target Budget / Value": inr_budget,
-        "Reasoning": reason,
-        "Status": status
-    }
-    st.session_state.trade_log.insert(0, log_entry)
-
 # ==========================================
-# 3. DASHBOARD CONFIGURATION
+# 3. GLOBAL SHARED BOT ENGINE
 # ==========================================
-st.set_page_config(page_title="Position-Aware AI Bot", layout="wide")
-st.title("🦙 Llama-3.1 CoinDCX Bot (Position-Aware)")
+class GlobalBotEngine:
+    def __init__(self):
+        self.is_running = False
+        self.trade_log = []
+        self.thread = None
+        self.coin = "BTC"
+        self.trade_amount_inr = 150.0
+        self.check_interval = 5
 
-if "trade_log" not in st.session_state:
-    st.session_state.trade_log = []
+    def log_trade(self, action, crypto_amt, inr_budget, reason, status):
+        log_entry = {
+            "Time": datetime.now().strftime("%I:%M:%S %p"),
+            "Action": action,
+            "Quantity": crypto_amt,
+            "Target Budget / Value": inr_budget,
+            "Reasoning": reason,
+            "Status": status
+        }
+        self.trade_log.insert(0, log_entry)
 
-# ==========================================
-# 4. BOT SETTINGS UI
-# ==========================================
-col1, col2, col3 = st.columns(3)
-with col1:
-    coin = st.text_input("Coin Symbol (e.g., BTC, ETH, XRP)", "BTC").upper()
-with col2:
-    trade_amount_inr = st.number_input("Target BUY Budget (INR)", min_value=1.0, value=150.0, step=10.0)
-with col3:
-    check_interval = st.number_input("Check Every (Minutes)", min_value=1, value=5)
+    def start(self, coin, trade_amount_inr, check_interval):
+        if not self.is_running:
+            self.coin = coin
+            self.trade_amount_inr = trade_amount_inr
+            self.check_interval = check_interval
+            self.is_running = True
+            self.thread = threading.Thread(target=self._run_loop, daemon=True)
+            self.thread.start()
 
-market_symbol = f"{coin}INR"
-candle_pair = f"I-{coin}_INR"
+    def stop(self):
+        self.is_running = False
 
-# Fetch Live Balances (INR + Target Coin)
-balance_body = {"timestamp": int(round(time.time() * 1000))}
-balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
-
-inr_balance = 0.0
-coin_balance = 0.0
-
-st.subheader("💰 Live Wallet Balances")
-if isinstance(balances_data, list):
-    for b in balances_data:
-        curr = b.get('currency', '')
-        bal = float(b.get('balance', 0))
-        if curr == 'INR':
-            inr_balance = bal
-        elif curr == coin:
-            coin_balance = bal
+    def _run_loop(self):
+        """Runs continuously in the background independent of UI sessions."""
+        while self.is_running:
+            try:
+                self._execute_cycle()
+            except Exception as e:
+                self.log_trade("ERROR", "0", "₹0.00", str(e), "Background Crash")
             
-    active_balances = [b for b in balances_data if float(b.get('balance', 0)) > 0]
-    if active_balances:
-        df_balance = pd.DataFrame(active_balances)[['currency', 'balance']]
-        st.dataframe(df_balance.T, use_container_width=True, hide_index=True)
+            # Sleep in short increments so stopping is instant when triggered
+            sleep_seconds = int(self.check_interval * 60)
+            for _ in range(sleep_seconds):
+                if not self.is_running:
+                    break
+                time.sleep(1)
 
-st.divider()
-auto_mode = st.toggle("🚀 Enable Fully Automated Trading", value=False)
+    def _execute_cycle(self):
+        market_symbol = f"{self.coin}INR"
+        candle_pair = f"I-{self.coin}_INR"
 
-# ==========================================
-# 5. ACTIVITY LOG VIEWER
-# ==========================================
-st.subheader("📋 Bot Activity Log")
-log_container = st.empty()
+        # 1. Fetch Balances
+        balance_body = {"timestamp": int(round(time.time() * 1000))}
+        balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
+        
+        inr_balance = 0.0
+        coin_balance = 0.0
+        if isinstance(balances_data, list):
+            for b in balances_data:
+                curr = b.get('currency', '')
+                bal = float(b.get('balance', 0))
+                if curr == 'INR':
+                    inr_balance = bal
+                elif curr == self.coin:
+                    coin_balance = bal
 
-def render_logs():
-    if not st.session_state.trade_log:
-        log_container.info("No actions taken yet.")
-    else:
-        df_logs = pd.DataFrame(st.session_state.trade_log)
-        log_container.dataframe(df_logs, use_container_width=True, hide_index=True)
-
-render_logs()
-st.divider()
-
-# ==========================================
-# 6. AUTOMATION LOOP LOGIC
-# ==========================================
-if auto_mode:
-    status_msg = st.empty()
-    status_msg.warning("Bot is ACTIVE. Analyzing market...")
-    
-    try:
-        # A. Fetch CoinDCX precision rules
+        # 2. Precision Rules
         markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
         markets = requests.get(markets_url).json()
         market_info = next((m for m in markets if m.get('symbol') == market_symbol), None)
         precision = int(market_info.get('target_currency_precision', 5)) if market_info else 5
         multiplier = 10 ** precision
-        
-        # B. Get Live Price
+
+        # 3. Live Price
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         ticker = next((t for t in tickers if t.get('market') == market_symbol), None)
-        
         if not ticker:
-            log_trade("ERROR", "0", f"₹{trade_amount_inr}", f"Market {market_symbol} not found.", "Failed")
-            st.stop()
+            self.log_trade("ERROR", "0", f"₹{self.trade_amount_inr}", f"Market {market_symbol} not found.", "Failed")
+            return
             
         current_price = float(ticker['last_price'])
-        
-        # C. Run AI Analysis
+
+        # 4. Fetch Chart Data for AI
         candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=1h&limit=10"
         candles_data = requests.get(candles_url).json()
         
@@ -141,7 +132,8 @@ if auto_mode:
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         df = df.sort_values(by='time', ascending=True)
         market_data_str = df[['time', 'open', 'high', 'low', 'close', 'volume']].to_string(index=False)
-        
+
+        # 5. Ask Groq AI
         client = Groq(api_key=GROQ_API_KEY)
         system_prompt = """You are a highly analytical crypto trading bot. 
         You MUST respond ONLY with a valid JSON object containing:
@@ -163,13 +155,10 @@ if auto_mode:
         decision_data = json.loads(response.choices[0].message.content)
         action = decision_data.get("action", "HOLD").upper()
         reasoning = decision_data.get("reasoning", "No reason provided.")
-        
-        # ==========================================
-        # D. POSITION-AWARE TRADE EXECUTION
-        # ==========================================
+
+        # 6. Execute Trade
         if action == "BUY":
-            # Calculate how much crypto to buy using specified INR budget
-            raw_crypto = trade_amount_inr / current_price
+            raw_crypto = self.trade_amount_inr / current_price
             qty_down = math.floor(raw_crypto * multiplier) / multiplier
             val_down = qty_down * current_price
             
@@ -180,10 +169,9 @@ if auto_mode:
                 
             actual_cost = buy_crypto_amount * current_price
             
-            # Check INR Balance
             if actual_cost > inr_balance:
                 reason_msg = f"AI signaled BUY, but cost (₹{actual_cost:.2f}) exceeds INR balance (₹{inr_balance:.2f})."
-                log_trade("BUY SKIPPED", "0", f"₹{actual_cost:.2f}", reason_msg, "Insufficient INR")
+                self.log_trade("BUY SKIPPED", "0", f"₹{actual_cost:.2f}", reason_msg, "Insufficient INR")
             else:
                 formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                 order_body = {
@@ -193,24 +181,22 @@ if auto_mode:
                     "total_quantity": formatted_qty,
                     "timestamp": int(round(time.time() * 1000))
                 }
-                
                 order_response = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                 if "orders" in order_response or "id" in order_response:
-                    log_trade("BUY", formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
+                    self.log_trade("BUY", formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
                 else:
                     err = order_response.get("message", "API Error")
-                    log_trade("BUY FAILED", formatted_qty, f"₹{actual_cost:.2f}", reasoning, f"Rejected: {err}")
+                    self.log_trade("BUY FAILED", formatted_qty, f"₹{actual_cost:.2f}", reasoning, f"Rejected: {err}")
 
         elif action == "SELL":
-            # SELL using the HELD CRYPTO BALANCE in the wallet
             sell_crypto_amount = math.floor(coin_balance * multiplier) / multiplier
             actual_value = sell_crypto_amount * current_price
             
             if sell_crypto_amount <= 0:
-                log_trade("SELL SKIPPED", "0", "₹0.00", f"AI signaled SELL, but you hold 0 {coin}.", "No Crypto Held")
+                self.log_trade("SELL SKIPPED", "0", "₹0.00", f"AI signaled SELL, but you hold 0 {self.coin}.", "No Crypto Held")
             elif actual_value < 100.0:
-                reason_msg = f"AI signaled SELL, but your held {coin} ({sell_crypto_amount}) is worth ₹{actual_value:.2f}, below CoinDCX's ₹100 limit."
-                log_trade("SELL SKIPPED", f"{sell_crypto_amount:.{precision}f}", f"₹{actual_value:.2f}", reason_msg, "Below Min Order")
+                reason_msg = f"AI signaled SELL, but held {self.coin} ({sell_crypto_amount}) is worth ₹{actual_value:.2f}, below CoinDCX ₹100 limit."
+                self.log_trade("SELL SKIPPED", f"{sell_crypto_amount:.{precision}f}", f"₹{actual_value:.2f}", reason_msg, "Below Min Order")
             else:
                 formatted_qty = f"{sell_crypto_amount:.{precision}f}"
                 order_body = {
@@ -220,25 +206,68 @@ if auto_mode:
                     "total_quantity": formatted_qty,
                     "timestamp": int(round(time.time() * 1000))
                 }
-                
                 order_response = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                 if "orders" in order_response or "id" in order_response:
-                    log_trade("SELL", formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
+                    self.log_trade("SELL", formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                 else:
                     err = order_response.get("message", "API Error")
-                    log_trade("SELL FAILED", formatted_qty, f"₹{actual_value:.2f}", reasoning, f"Rejected: {err}")
-                    
+                    self.log_trade("SELL FAILED", formatted_qty, f"₹{actual_value:.2f}", reasoning, f"Rejected: {err}")
         else:
-            log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
-            
-    except Exception as e:
-        log_trade("ERROR", "0", "₹0.00", str(e), "Script Crashed")
-        
-    render_logs()
-    
-    # Sleep and Rerun Loop
-    time_to_wait = check_interval * 60
-    with st.spinner(f"Analysis complete. Sleeping for {check_interval} minutes..."):
-        time.sleep(time_to_wait)
-    
+            self.log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
+
+
+# Cache instance globally across ALL web sessions/users
+@st.cache_resource
+def get_global_bot():
+    return GlobalBotEngine()
+
+bot = get_global_bot()
+
+# ==========================================
+# 4. STREAMLIT UI
+# ==========================================
+st.set_page_config(page_title="Global Live AI Bot", layout="wide")
+st.title("🌐 Synchronized Live CoinDCX AI Bot")
+
+# --- LIVE GLOBAL STATUS INDICATOR ---
+if bot.is_running:
+    st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**, Check Interval: **{bot.check_interval} min**)")
+else:
+    st.error("🔴 **GLOBAL STATUS: STOPPED**")
+
+st.divider()
+
+# --- CONTROLS ---
+col1, col2, col3 = st.columns(3)
+with col1:
+    coin_input = st.text_input("Coin Symbol", value=bot.coin).upper()
+with col2:
+    budget_input = st.number_input("Target BUY Budget (INR)", min_value=10.0, value=float(bot.trade_amount_inr), step=10.0)
+with col3:
+    interval_input = st.number_input("Check Every (Minutes)", min_value=1, value=int(bot.check_interval))
+
+ctrl_col1, ctrl_col2 = st.columns(2)
+with ctrl_col1:
+    if st.button("▶️ START BOT (Global)", type="primary", use_container_width=True, disabled=bot.is_running):
+        bot.start(coin_input, budget_input, interval_input)
+        st.rerun()
+
+with ctrl_col2:
+    if st.button("⏹️ STOP BOT (Global)", use_container_width=True, disabled=not bot.is_running):
+        bot.stop()
+        st.rerun()
+
+st.divider()
+
+# --- SHARED ACTIVITY LOG ---
+st.subheader("📋 Live Activity Log (Shared Across All Tabs)")
+if not bot.trade_log:
+    st.info("No activity recorded yet.")
+else:
+    df_logs = pd.DataFrame(bot.trade_log)
+    st.dataframe(df_logs, use_container_width=True, hide_index=True)
+
+# --- AUTO REFRESH OPEN UI TABS EVERY 10 SECONDS ---
+if bot.is_running:
+    time.sleep(10)
     st.rerun()
