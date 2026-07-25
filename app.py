@@ -125,7 +125,6 @@ class GlobalBotEngine:
                 time.sleep(1)
 
     def _execute_cycle(self):
-        # 1. Fetch Actual Balances
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
@@ -138,14 +137,12 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Fetch Live Market Tickers & Precisions
         markets = requests.get("https://api.coindcx.com/exchange/v1/markets_details").json()
         market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
         
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
-        # RECOVERY LOGIC
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -159,12 +156,10 @@ class GlobalBotEngine:
                             "invested": value
                         }
 
-        # CLEANUP
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 del self.active_positions[coin]
 
-        # 3. MANAGE HELD POSITIONS (Pro-Trader AI Exits)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -185,7 +180,6 @@ class GlobalBotEngine:
                 df['close'] = df['close'].astype(float)
                 df = df.sort_values(by='time', ascending=True)
                 
-                # --- RSI ---
                 delta = df['close'].diff()
                 gain = delta.clip(lower=0)
                 loss = -1 * delta.clip(upper=0)
@@ -194,14 +188,12 @@ class GlobalBotEngine:
                 rs = avg_gain / avg_loss
                 df['RSI'] = 100 - (100 / (1 + rs))
 
-                # --- MACD ---
                 exp1 = df['close'].ewm(span=12, adjust=False).mean()
                 exp2 = df['close'].ewm(span=26, adjust=False).mean()
                 df['MACD'] = exp1 - exp2
                 df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
                 df['MACD_Hist'] = df['MACD'] - df['Signal']
 
-                # --- Bollinger Bands ---
                 df['SMA_20'] = df['close'].rolling(window=20).mean()
                 df['STD_20'] = df['close'].rolling(window=20).std()
                 df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
@@ -293,7 +285,6 @@ class GlobalBotEngine:
             self.cooldown_counter -= 1
             return
 
-        # 4. LOOK FOR NEW OPPORTUNITIES
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
         if (current_invested + self.trade_amount) <= self.max_budget:
@@ -348,7 +339,6 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # 5. PRO-TRADER AI BUY VERIFICATION
             if best_coin and lowest_rsi < 45:
                 client = Groq(api_key=GROQ_API_KEY)
                 system_prompt = """You are a ruthless, highly profitable quantitative crypto trader.
@@ -419,123 +409,121 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v17():
+def get_global_bot_v18():
     return GlobalBotEngine()
 
-bot = get_global_bot_v17()
+bot = get_global_bot_v18()
 
 # ==========================================
-# 4. STREAMLIT UI CONFIG & CUSTOM STYLING
+# 4. STREAMLIT UI CONFIG & CUSTOM STYLING (LIGHT MODE)
 # ==========================================
 st.set_page_config(
-    page_title="Pro-Trader AI Portfolio Manager", 
-    page_icon="⚡", 
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="AI Portfolio Manager", 
+    page_icon="🏦", 
+    layout="wide"
 )
 
 def inject_custom_css():
     st.markdown("""
     <style>
-        /* Base Page Adjustments */
+        /* Base Light Theme Colors */
         .stApp {
-            background-color: #0d1117;
-            color: #e6edf3;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: #f8f9fa; /* Light, airy background */
+            color: #202124;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         }
 
-        /* Hide Streamlit Header Elements for Clean App Feel */
-        header {visibility: hidden;}
-        footer {visibility: hidden;}
+        /* Clean up top padding */
+        .block-container {
+            padding-top: 2rem !important;
+        }
 
-        /* Modernized Sidebar */
+        /* Sidebar Styling */
         [data-testid="stSidebar"] {
-            background-color: #161b22;
-            border-right: 1px solid #30363d;
+            background-color: #ffffff;
+            border-right: 1px solid #e0e0e0;
         }
 
-        /* Glassmorphism Cards */
+        /* Hero Metric Cards (Light Mode Pro) */
         .metric-card {
-            background: linear-gradient(135deg, rgba(22, 27, 34, 0.8), rgba(13, 17, 23, 0.9));
-            border: 1px solid #30363d;
+            background: #ffffff;
+            border: 1px solid #eaebed;
             border-radius: 12px;
-            padding: 16px;
-            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.25);
-            backdrop-filter: blur(8px);
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
             margin-bottom: 12px;
-            transition: transform 0.2s ease, border-color 0.2s ease;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
         .metric-card:hover {
-            border-color: #58a6ff;
             transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
+            border-color: #1a73e8;
         }
 
         .metric-title {
-            font-size: 0.82rem;
-            color: #8b949e;
+            font-size: 0.85rem;
+            color: #5f6368;
             text-transform: uppercase;
             letter-spacing: 0.8px;
             font-weight: 600;
-            margin-bottom: 6px;
+            margin-bottom: 8px;
         }
 
         .metric-value {
-            font-size: 1.6rem;
+            font-size: 1.8rem;
             font-weight: 700;
-            color: #f0f6fc;
+            color: #202124;
         }
 
         .metric-sub {
-            font-size: 0.8rem;
-            margin-top: 4px;
+            font-size: 0.85rem;
+            margin-top: 6px;
             font-weight: 500;
+            color: #5f6368;
         }
 
-        /* Status Colors */
-        .text-green { color: #2ea043; }
-        .text-red { color: #f85149; }
-        .text-blue { color: #58a6ff; }
+        /* Text Status Colors */
+        .text-green { color: #0f9d58 !important; }
+        .text-red { color: #d23f31 !important; }
+        .text-blue { color: #1a73e8 !important; }
 
         /* Custom Progress Bar Styling */
         .stProgress > div > div > div > div {
-            background-color: #238636;
-            border-radius: 6px;
+            background-color: #1a73e8;
         }
 
-        /* Dataframes & Tables Styling */
-        [data-testid="stDataFrame"] {
-            background-color: #161b22;
-            border-radius: 10px;
-            border: 1px solid #30363d;
-            padding: 4px;
+        /* Form & Setup Containers */
+        .settings-box {
+            background: #ffffff;
+            border: 1px solid #eaebed;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+            margin-bottom: 24px;
         }
 
         /* Tab Polish */
         .stTabs [data-baseweb="tab-list"] {
-            gap: 8px;
-            background-color: #161b22;
-            padding: 6px;
-            border-radius: 10px;
-            border: 1px solid #30363d;
+            background-color: transparent;
+            border-bottom: 1px solid #e0e0e0;
+            gap: 16px;
         }
 
         .stTabs [data-baseweb="tab"] {
-            height: 40px;
-            border-radius: 6px;
-            color: #8b949e;
+            height: 48px;
             font-weight: 600;
+            color: #5f6368;
         }
 
         .stTabs [aria-selected="true"] {
-            background-color: #21262d !important;
-            color: #58a6ff !important;
+            color: #1a73e8 !important;
+            border-bottom-color: #1a73e8 !important;
         }
 
-        /* Responsive Mobile Layout Overrides */
+        /* Responsive Mobile Handling */
         @media (max-width: 768px) {
-            .metric-value { font-size: 1.3rem; }
-            .metric-card { padding: 12px; }
-            .stColumns { flex-direction: column !important; }
+            .metric-value { font-size: 1.4rem; }
+            .metric-card { padding: 16px; }
         }
     </style>
     """, unsafe_allow_html=True)
@@ -545,74 +533,78 @@ inject_custom_css()
 # ==========================================
 # 5. SIDEBAR NAVIGATION & SYSTEM HEALTH
 # ==========================================
-st.sidebar.markdown("### ⚡ **Pro-Trader AI**")
-page = st.sidebar.radio("Navigation", ["📊 Live Portfolio Dashboard", "🤖 Bot Control & Logs"])
+st.sidebar.markdown("## 🏦 **AI Portfolio**")
+page = st.sidebar.radio("Navigation", ["📊 Live Dashboard", "⚙️ Bot Engine & Settings"])
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("#### System Health")
 
 if bot.is_running:
     st.sidebar.markdown("""
-        <div style="background: rgba(46, 160, 67, 0.15); border: 1px solid #2ea043; border-radius: 8px; padding: 10px; color: #3fb950; font-weight: 600; font-size: 0.88rem;">
+        <div style="background: #e6f4ea; border: 1px solid #ceead6; border-radius: 8px; padding: 12px; color: #137333; font-weight: 600; font-size: 0.9rem; text-align: center;">
             🟢 AUTOPILOT ACTIVE
         </div>
     """, unsafe_allow_html=True)
 else:
     st.sidebar.markdown("""
-        <div style="background: rgba(248, 81, 73, 0.15); border: 1px solid #f85149; border-radius: 8px; padding: 10px; color: #f85149; font-weight: 600; font-size: 0.88rem;">
+        <div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">
             🔴 AUTOPILOT STOPPED
         </div>
     """, unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption(f"⚡ Engine v17.0 | Model: GPT-120B")
+st.sidebar.caption("Version 18.0 (Light Mode) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
 # ==========================================
 
-if page == "🤖 Bot Control & Logs":
-    st.title("🤖 Bot Engine Controls & Live Logs")
+if page == "⚙️ Bot Engine & Settings":
+    st.title("⚙️ Engine Settings & Live Logs")
+    st.markdown("Configure your quantitative trading parameters and monitor real-time AI decisions.")
     
-    with st.expander("⚙️ Autopilot Configuration & Settings", expanded=not bot.is_running):
-        st.caption("Configure multi-coin candidates, risk-management parameters, and budget locks.")
+    # Clean Form UI
+    st.markdown('<div class="settings-box">', unsafe_allow_html=True)
+    st.markdown("#### 🎯 Trade Strategy")
+    cand_input = st.text_input("Assets to Monitor (Comma separated)", value="BTC, ETH, SOL, XRP, DOGE", help="The AI will scan these coins to find the best entry.")
+    
+    st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
+    colA, colB = st.columns(2)
+    with colA:
+        max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
+        tp_pct = st.number_input("Take-Profit Target (%)", min_value=0.5, value=float(bot.tp_pct), step=0.5)
+    with colB:
+        trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
+        sl_pct = st.number_input("Stop-Loss Limit (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
-        cand_input = st.text_input("Candidate Coins to Scan (comma separated)", value="BTC, ETH, SOL, XRP, DOGE")
-        
-        colA, colB = st.columns(2)
-        with colA:
-            max_bud = st.number_input("Max Total Portfolio Budget (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
-            tp_pct = st.number_input("Hard Take-Profit (%)", min_value=0.5, value=float(bot.tp_pct), step=0.5)
-        with colB:
-            trade_amt = st.number_input("Trade Size Per Coin (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
-            sl_pct = st.number_input("Hard Stop-Loss (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
-            
-        interval_input = st.number_input("Scan Market Every (Minutes)", min_value=1, value=int(bot.check_interval))
+    interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval))
+    st.markdown('</div>', unsafe_allow_html=True)
 
-        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
-        with ctrl_col1:
-            if st.button("▶️ START AUTOPILOT", type="primary", use_container_width=True, disabled=bot.is_running):
-                bot.start(cand_input, max_bud, trade_amt, tp_pct, sl_pct, interval_input)
-                st.rerun()
-        with ctrl_col2:
-            if st.button("⏹️ STOP BOT", use_container_width=True, disabled=not bot.is_running):
-                bot.stop()
-                st.rerun()
-        with ctrl_col3:
-            if st.button("🧹 CLEAR LOGS", use_container_width=True):
-                bot.trade_log.clear()
-                st.rerun()
+    # Action Buttons
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
+    with ctrl_col1:
+        if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
+            bot.start(cand_input, max_bud, trade_amt, tp_pct, sl_pct, interval_input)
+            st.rerun()
+    with ctrl_col2:
+        if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
+            bot.stop()
+            st.rerun()
+    with ctrl_col3:
+        if st.button("🧹 Clear Logs", use_container_width=True):
+            bot.trade_log.clear()
+            st.rerun()
 
     st.markdown("---")
 
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            st.info(f"⚡ **ACTIVE RUNNER** | Scanning **{len(bot.candidates)}** candidates | Target Budget: **₹{bot.max_budget}** | Check Interval: **{bot.check_interval} min**")
+            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets | Risk Cap: ₹{bot.max_budget} | Interval: {bot.check_interval}m")
         else:
-            st.warning("⚠️ **ENGINE IDLE** | Click 'Start Autopilot' above to begin automated trading.")
+            st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
-        st.subheader("📋 Real-Time Intelligence & Execution Log")
+        st.subheader("📡 Real-Time Execution Log")
         if not bot.trade_log:
             st.caption("No session activity logged yet.")
         else:
@@ -636,8 +628,9 @@ if page == "🤖 Bot Control & Logs":
     bot_logs_view()
 
 
-elif page == "📊 Live Portfolio Dashboard":
-    st.title("📊 Live Portfolio & Multi-Timeframe Analytics")
+elif page == "📊 Live Dashboard":
+    st.title("📊 Financial Overview")
+    st.markdown("Real-time portfolio tracking and historical performance analytics.")
 
     @st.fragment(run_every="10s")
     def portfolio_view():
@@ -725,15 +718,15 @@ elif page == "📊 Live Portfolio Dashboard":
 
         budget_pct = min(1.0, current_invested / bot.max_budget) if bot.max_budget > 0 else 0.0
 
-        # --- RESPONSIVE HEADER CARDS ---
+        # --- RESPONSIVE HERO CARDS ---
         m_col1, m_col2, m_col3 = st.columns(3)
         
         with m_col1:
             st.markdown(f"""
                 <div class="metric-card">
-                    <div class="metric-title">Available INR Balance</div>
+                    <div class="metric-title">Available Capital</div>
                     <div class="metric-value">₹{live_inr:,.2f}</div>
-                    <div class="metric-sub text-blue">CoinDCX Wallet Balance</div>
+                    <div class="metric-sub text-blue">Unallocated Exchange Wallet</div>
                 </div>
             """, unsafe_allow_html=True)
             
@@ -742,7 +735,8 @@ elif page == "📊 Live Portfolio Dashboard":
                 <div class="metric-card">
                     <div class="metric-title">Budget Utilized</div>
                     <div class="metric-value">₹{current_invested:,.2f}</div>
-                    <div class="metric-sub">Cap: ₹{bot.max_budget:,.2f}</div>
+                    <div class="metric-sub">Max Allocation Limit: ₹{bot.max_budget:,.2f}</div>
+                    <div style="margin-top: 8px;"></div>
                 </div>
             """, unsafe_allow_html=True)
             st.progress(budget_pct)
@@ -752,28 +746,28 @@ elif page == "📊 Live Portfolio Dashboard":
             pnl_pct_str = f"{(unrealized_pnl/current_invested*100):.2f}%" if current_invested else "0.00%"
             st.markdown(f"""
                 <div class="metric-card">
-                    <div class="metric-title">Open Positions PnL</div>
+                    <div class="metric-title">Floating P&L</div>
                     <div class="metric-value {pnl_color}">₹{unrealized_pnl:,.2f}</div>
-                    <div class="metric-sub {pnl_color}">{pnl_pct_str} Unsold Floating ROI</div>
+                    <div class="metric-sub {pnl_color}">{pnl_pct_str} Total Unsold Return</div>
                 </div>
             """, unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
 
         # --- MULTI-TIMEFRAME ANALYTICS TABS ---
-        st.subheader("📈 Multi-Timeframe Realized Performance (IST)")
+        st.subheader("📈 Performance History")
         
         tab_today, tab_yesterday, tab_this_m, tab_last_m, tab_all = st.tabs([
-            "📅 Today", "⏪ Yesterday", "🗓️ This Month", "⏮️ Last Month", "📜 2-Year Lifetime"
+            "Today", "Yesterday", "This Month", "Last Month", "All-Time"
         ])
 
         def render_period_metrics(p_data):
             net = p_data["profit"] - p_data["loss"]
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("🟢 Realized Profit", f"₹{p_data['profit']:,.2f}")
-            c2.metric("🔴 Realized Loss", f"₹{p_data['loss']:,.2f}")
-            c3.metric("⚖️ Net P&L", f"₹{net:,.2f}", delta=f"₹{net:,.2f}")
-            c4.metric("📊 Closed Trades", f"{p_data['count']}")
+            c1.metric("Gross Profit", f"₹{p_data['profit']:,.2f}")
+            c2.metric("Gross Loss", f"₹{p_data['loss']:,.2f}")
+            c3.metric("Net Return", f"₹{net:,.2f}", delta=f"₹{net:,.2f}")
+            c4.metric("Trades Executed", f"{p_data['count']}")
 
         with tab_today: render_period_metrics(period_stats["today"])
         with tab_yesterday: render_period_metrics(period_stats["yesterday"])
@@ -781,10 +775,10 @@ elif page == "📊 Live Portfolio Dashboard":
         with tab_last_m: render_period_metrics(period_stats["last_month"])
         with tab_all: render_period_metrics(period_stats["all_time"])
 
-        st.markdown("---")
+        st.markdown("<br>", unsafe_allow_html=True)
 
         # --- ACTIVE PORTFOLIO TABLE ---
-        st.subheader("💼 Active Portfolio Positions")
+        st.subheader("💼 Active Holdings")
         if not bot.active_positions:
             st.info("No active positions held. Bot is scanning candidates for precision bounce setups.")
         else:
@@ -796,20 +790,20 @@ elif page == "📊 Live Portfolio Dashboard":
                 pnl_pct = (pnl / pos['invested']) * 100
                 
                 pos_data.append({
-                    "Coin": coin,
+                    "Asset": coin,
                     "Invested (INR)": f"₹{pos['invested']:.2f}",
                     "Current Value": f"₹{curr_val:.2f}",
-                    "Entry Price": f"₹{pos['entry_price']:.2f}",
+                    "Avg Entry": f"₹{pos['entry_price']:.2f}",
                     "Current Price": f"₹{curr_price:.2f}",
-                    "PnL %": f"{pnl_pct:.2f}%",
+                    "Return %": f"{pnl_pct:.2f}%",
                     "PnL (INR)": f"₹{pnl:.2f}"
                 })
             st.dataframe(pd.DataFrame(pos_data), use_container_width=True)
 
-        st.markdown("---")
+        st.markdown("<br>", unsafe_allow_html=True)
 
         # --- CLOSED TRADES ARCHIVE ---
-        st.subheader("📜 Historical Closed Trades Archive")
+        st.subheader("📂 Settled Transactions")
         if not bot.completed_trades:
             st.caption("No completed trades recorded in history file yet.")
         else:
@@ -817,14 +811,14 @@ elif page == "📊 Live Portfolio Dashboard":
             for trade in reversed(bot.completed_trades):
                 t_dt = (datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
                 history_rows.append({
-                    "Time (IST)": t_dt,
-                    "Coin": trade["coin"],
-                    "Type": trade.get("type", "CLOSE"),
-                    "Invested": f"₹{trade['invested']:.2f}",
-                    "Entry Price": f"₹{trade['entry_price']:.2f}",
-                    "Exit Price": f"₹{trade['exit_price']:.2f}",
-                    "PnL (INR)": f"₹{trade['pnl']:.2f}",
-                    "PnL %": f"{trade.get('pnl_pct', 0.0):.2f}%"
+                    "Date & Time": t_dt,
+                    "Asset": trade["coin"],
+                    "Action": trade.get("type", "CLOSE"),
+                    "Amount": f"₹{trade['invested']:.2f}",
+                    "Entry": f"₹{trade['entry_price']:.2f}",
+                    "Exit": f"₹{trade['exit_price']:.2f}",
+                    "Net PnL": f"₹{trade['pnl']:.2f}",
+                    "Return %": f"{trade.get('pnl_pct', 0.0):.2f}%"
                 })
             st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
 
