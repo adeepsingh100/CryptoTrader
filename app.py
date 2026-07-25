@@ -156,7 +156,7 @@ class GlobalBotEngine:
         user_prompt = f"Analyze market metrics for {market_symbol}:\n\n{market_data_str}"
         
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",  # <--- UPGRADED TO GPT-OSS 120B
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -229,12 +229,12 @@ class GlobalBotEngine:
             self.log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
 
 
-# Cache instance globally across ALL web sessions (v5 prevents ghost threads)
+# Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v5():
+def get_global_bot_v6():
     return GlobalBotEngine()
 
-bot = get_global_bot_v5()
+bot = get_global_bot_v6()
 
 # ==========================================
 # 4. STREAMLIT UI & LIVE DISPLAY
@@ -252,7 +252,7 @@ with col3:
 
 ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
 with ctrl_col1:
-    if st.button("▶️ START BOT", type="primary", use_keyword=True, use_container_width=True, disabled=bot.is_running):
+    if st.button("▶️ START BOT", type="primary", use_container_width=True, disabled=bot.is_running):
         bot.start(coin_input, budget_input, interval_input)
         st.rerun()
 
