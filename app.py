@@ -7,6 +7,7 @@ import hashlib
 import requests
 import math
 import threading
+import os
 from groq import Groq
 from datetime import datetime, timezone, timedelta
 
@@ -23,8 +24,28 @@ except Exception:
     GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 2. PERSISTENT STORAGE HELPERS
 # ==========================================
+HISTORY_FILE = "trades_history.json"
+
+def load_trade_history():
+    """Loads historical trade data from persistent disk storage."""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_trade_history(completed_trades):
+    """Saves completed trade history to local disk storage."""
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(completed_trades, f, indent=2)
+    except Exception:
+        pass
+
 def coindcx_auth_post(endpoint, body):
     """Signs and sends authenticated requests to CoinDCX."""
     url = f"https://api.coindcx.com{endpoint}"
@@ -60,8 +81,8 @@ class GlobalBotEngine:
         self.inr_balance = 0.0
         self.active_positions = {}  # Format: {'BTC': {'qty': 0.01, 'entry_price': 50000, 'invested': 110}}
         self.last_prices = {}       # Live prices stored for UI dashboard
-        self.completed_trades = []  # Stores closed trades for 24h P&L math
-        self.realized_pnl = 0.0     # All-time session PnL
+        self.completed_trades = load_trade_history()  # Load 2-year history from file
+        self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
         self.cooldown_counter = 0
 
     def log_trade(self, action, coin, qty, value, reason, status):
@@ -179,12 +200,19 @@ class GlobalBotEngine:
                         profit_inr = actual_value - pos['invested']
                         self.realized_pnl += profit_inr
                         
-                        # Store trade record for 24-hour daily P&L calculations
-                        self.completed_trades.append({
+                        # Store trade record & persist to local disk history
+                        trade_record = {
                             "timestamp": time.time(),
                             "coin": coin,
-                            "pnl": profit_inr
-                        })
+                            "entry_price": pos['entry_price'],
+                            "exit_price": curr_price,
+                            "invested": pos['invested'],
+                            "pnl": profit_inr,
+                            "pnl_pct": pnl_pct,
+                            "type": action_type
+                        }
+                        self.completed_trades.append(trade_record)
+                        save_trade_history(self.completed_trades)
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                         del self.active_positions[coin]
@@ -312,19 +340,19 @@ class GlobalBotEngine:
 
 # Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v10():
+def get_global_bot_v11():
     return GlobalBotEngine()
 
-bot = get_global_bot_v10()
+bot = get_global_bot_v11()
 
 # ==========================================
 # 4. STREAMLIT UI & PORTFOLIO DASHBOARD
 # ==========================================
 st.set_page_config(page_title="AI Portfolio Manager", layout="wide")
-st.title("🌐 Fully Autonomous AI Portfolio Manager")
+st.title("🌐 Autonomous AI Portfolio Manager & Historical Ledger")
 
 with st.expander("⚙️ Autopilot Configuration & Start", expanded=not bot.is_running):
-    st.info("The bot will automatically scan the coins below, select the best dips, and trade automatically within your Max Budget limit.")
+    st.info("The bot automatically scans candidates, selects oversold dips, and trades within your Max Budget limit.")
     
     cand_input = st.text_input("Candidate Coins to Scan (comma separated)", value="BTC, ETH, SOL, XRP, DOGE")
     
@@ -348,9 +376,8 @@ with st.expander("⚙️ Autopilot Configuration & Start", expanded=not bot.is_r
             bot.stop()
             st.rerun()
     with ctrl_col3:
-        if st.button("🧹 CLEAR LOGS & HISTORY", use_container_width=True):
+        if st.button("🧹 CLEAR LOGS", use_container_width=True):
             bot.trade_log.clear()
-            bot.completed_trades.clear()
             st.rerun()
 
 st.divider()
@@ -363,25 +390,70 @@ def live_status_board():
     else:
         st.error("🔴 **BOT STOPPED**")
         
-    # --- CALCULATE 24-HOUR / TODAY'S P&L (IST TIMEZONE) ---
+    # --- TIME CALCULATIONS (IST TIMEZONE) ---
     ist_offset = timedelta(hours=5, minutes=30)
     now_ist = datetime.now(timezone.utc) + ist_offset
     today_date_ist = now_ist.date()
+    yesterday_date_ist = today_date_ist - timedelta(days=1)
+    
+    current_year = now_ist.year
+    current_month = now_ist.month
+    
+    if current_month == 1:
+        last_month_year = current_year - 1
+        last_month_num = 12
+    else:
+        last_month_year = current_year
+        last_month_num = current_month - 1
 
-    today_profit = 0.0
-    today_loss = 0.0
+    two_years_ago = now_ist - timedelta(days=730)
 
+    # Performance Bucket Containers
+    period_stats = {
+        "today": {"profit": 0.0, "loss": 0.0, "count": 0},
+        "yesterday": {"profit": 0.0, "loss": 0.0, "count": 0},
+        "this_month": {"profit": 0.0, "loss": 0.0, "count": 0},
+        "last_month": {"profit": 0.0, "loss": 0.0, "count": 0},
+        "all_time": {"profit": 0.0, "loss": 0.0, "count": 0}
+    }
+
+    # Process all historical trades
     for trade in bot.completed_trades:
-        trade_time_ist = (datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset).date()
-        if trade_time_ist == today_date_ist:
-            if trade["pnl"] >= 0:
-                today_profit += trade["pnl"]
-            else:
-                today_loss += abs(trade["pnl"])
+        trade_dt_ist = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset
+        trade_date = trade_dt_ist.date()
+        pnl = trade.get("pnl", 0.0)
 
-    today_net_pnl = today_profit - today_loss
+        if trade_dt_ist >= two_years_ago:
+            # 2-Year Lifetime
+            if pnl >= 0: period_stats["all_time"]["profit"] += pnl
+            else: period_stats["all_time"]["loss"] += abs(pnl)
+            period_stats["all_time"]["count"] += 1
 
-    # --- TOP WALLET & BUDGET METRICS ---
+            # Today
+            if trade_date == today_date_ist:
+                if pnl >= 0: period_stats["today"]["profit"] += pnl
+                else: period_stats["today"]["loss"] += abs(pnl)
+                period_stats["today"]["count"] += 1
+
+            # Yesterday
+            if trade_date == yesterday_date_ist:
+                if pnl >= 0: period_stats["yesterday"]["profit"] += pnl
+                else: period_stats["yesterday"]["loss"] += abs(pnl)
+                period_stats["yesterday"]["count"] += 1
+
+            # This Month
+            if trade_dt_ist.year == current_year and trade_dt_ist.month == current_month:
+                if pnl >= 0: period_stats["this_month"]["profit"] += pnl
+                else: period_stats["this_month"]["loss"] += abs(pnl)
+                period_stats["this_month"]["count"] += 1
+
+            # Last Month
+            if trade_dt_ist.year == last_month_year and trade_dt_ist.month == last_month_num:
+                if pnl >= 0: period_stats["last_month"]["profit"] += pnl
+                else: period_stats["last_month"]["loss"] += abs(pnl)
+                period_stats["last_month"]["count"] += 1
+
+    # --- ACCOUNT SUMMARY ---
     current_invested = sum(p['invested'] for p in bot.active_positions.values())
     unrealized_pnl = 0.0
     for coin, pos in bot.active_positions.items():
@@ -394,13 +466,33 @@ def live_status_board():
     metric_col2.metric("💳 Budget Utilized", f"₹{current_invested:,.2f}", f"of ₹{bot.max_budget:,.2f} Max", delta_color="off")
     metric_col3.metric("📈 Open Positions PnL", f"₹{unrealized_pnl:,.2f}", f"{(unrealized_pnl/current_invested*100):.2f}%" if current_invested else "0.00%")
 
-    # --- 24-HOUR TODAY'S PERFORMANCE ROW ---
-    st.markdown("##### 📅 Today's Performance (Resets Daily at Midnight IST)")
-    day_col1, day_col2, day_col3, day_col4 = st.columns(4)
-    day_col1.metric("🟢 Today's Profit", f"₹{today_profit:,.2f}")
-    day_col2.metric("🔴 Today's Loss", f"₹{today_loss:,.2f}")
-    day_col3.metric("⚖️ Today's Net P&L", f"₹{today_net_pnl:,.2f}", delta=f"₹{today_net_pnl:,.2f}")
-    day_col4.metric("🏦 Session Total Realized", f"₹{bot.realized_pnl:,.2f}")
+    st.divider()
+
+    # --- MULTI-TIMEFRAME PERFORMANCE ANALYTICS ---
+    st.subheader("📈 Multi-Timeframe Performance Analytics (IST)")
+    
+    tab_today, tab_yesterday, tab_this_m, tab_last_m, tab_all = st.tabs([
+        "📅 Today", "⏪ Yesterday", "🗓️ This Month", "⏮️ Last Month", "📜 2-Year Lifetime"
+    ])
+
+    def render_period_metrics(p_data):
+        net = p_data["profit"] - p_data["loss"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🟢 Realized Profit", f"₹{p_data['profit']:,.2f}")
+        c2.metric("🔴 Realized Loss", f"₹{p_data['loss']:,.2f}")
+        c3.metric("⚖️ Net P&L", f"₹{net:,.2f}", delta=f"₹{net:,.2f}")
+        c4.metric("📊 Closed Trades", f"{p_data['count']}")
+
+    with tab_today:
+        render_period_metrics(period_stats["today"])
+    with tab_yesterday:
+        render_period_metrics(period_stats["yesterday"])
+    with tab_this_m:
+        render_period_metrics(period_stats["this_month"])
+    with tab_last_m:
+        render_period_metrics(period_stats["last_month"])
+    with tab_all:
+        render_period_metrics(period_stats["all_time"])
 
     st.divider()
 
@@ -427,13 +519,32 @@ def live_status_board():
             })
         st.dataframe(pd.DataFrame(pos_data), use_container_width=True)
 
-    # --- Activity Logs ---
-    st.subheader("📋 Autonomous Activity Log")
+    # --- Historical Closed Trades Table ---
+    st.subheader("📜 Historical Closed Trades Archive")
+    if not bot.completed_trades:
+        st.caption("No closed trades in history file yet.")
+    else:
+        history_rows = []
+        for trade in reversed(bot.completed_trades):
+            t_dt = (datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+            history_rows.append({
+                "Time (IST)": t_dt,
+                "Coin": trade["coin"],
+                "Type": trade.get("type", "CLOSE"),
+                "Invested": f"₹{trade['invested']:.2f}",
+                "Entry Price": f"₹{trade['entry_price']:.2f}",
+                "Exit Price": f"₹{trade['exit_price']:.2f}",
+                "PnL (INR)": f"₹{trade['pnl']:.2f}",
+                "PnL %": f"{trade.get('pnl_pct', 0.0):.2f}%"
+            })
+        st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+
+    # --- Live Activity Logs ---
+    st.subheader("📋 Real-Time Activity Log")
     if not bot.trade_log:
-        st.caption("No activity recorded yet.")
+        st.caption("No session activity recorded yet.")
     else:
         formatted_logs = []
-        
         for entry in bot.trade_log:
             e = entry.copy()
             if "timestamp" in e:
