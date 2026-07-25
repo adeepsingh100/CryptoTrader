@@ -7,7 +7,6 @@ import hashlib
 import requests
 import math
 import threading
-import os
 from groq import Groq
 from datetime import datetime, timezone, timedelta
 
@@ -243,7 +242,9 @@ class GlobalBotEngine:
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
-        # RECOVERY
+        # ==========================================
+        # RECOVERY (Picks up externally bought coins)
+        # ==========================================
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -256,13 +257,19 @@ class GlobalBotEngine:
                             "entry_price": curr_price,
                             "invested": value
                         }
+                        # Force the bot to log when it finds a new coin!
+                        self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected coin in wallet from external trade.", "Wallet Sync")
 
-        # CLEANUP
+        # ==========================================
+        # CLEANUP (Removes externally sold coins)
+        # ==========================================
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
+                # Force the bot to log when a coin disappears!
+                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Coin missing from wallet. Assuming external/manual sell.", "Wallet Sync")
                 del self.active_positions[coin]
 
-        # MANAGE POSITIONS
+        # MANAGE POSITIONS (Pro-Trader AI Exits)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -514,10 +521,10 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v22():
+def get_global_bot_v23():
     return GlobalBotEngine()
 
-bot = get_global_bot_v22()
+bot = get_global_bot_v23()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -580,7 +587,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 22.0 (Live Cloud Diagnostics) • GPT-120B")
+st.sidebar.caption("Version 23.0 (Sync Detector) • GPT-120B")
 
 
 # ==========================================
