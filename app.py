@@ -9,6 +9,7 @@ import math
 import threading
 from groq import Groq
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # ==========================================
 # 1. SECURE API KEYS (From Streamlit Secrets)
@@ -52,9 +53,11 @@ class GlobalBotEngine:
         self.check_interval = 5
 
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
-        ist_timezone = timezone(timedelta(hours=5, minutes=30))
+        # Force exact Indian Standard Time (Asia/Kolkata)
+        ist_time = datetime.now(ZoneInfo("Asia/Kolkata"))
+        
         log_entry = {
-            "Time": datetime.now(ist_timezone).strftime("%I:%M:%S %p"),
+            "Time": ist_time.strftime("%I:%M:%S %p"),
             "Action": action,
             "Quantity": crypto_amt,
             "Target Budget / Value": inr_budget,
