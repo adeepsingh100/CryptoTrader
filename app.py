@@ -50,6 +50,8 @@ class GlobalBotEngine:
         self.coin = "BTC"
         self.trade_amount_inr = 150.0
         self.check_interval = 5
+        self.inr_balance = 0.0
+        self.coin_balance = 0.0
 
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
         # Store raw UTC epoch timestamp so UI renders IST accurately
@@ -98,16 +100,16 @@ class GlobalBotEngine:
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
-        inr_balance = 0.0
-        coin_balance = 0.0
+        self.inr_balance = 0.0
+        self.coin_balance = 0.0
         if isinstance(balances_data, list):
             for b in balances_data:
                 curr = b.get('currency', '')
                 bal = float(b.get('balance', 0))
                 if curr == 'INR':
-                    inr_balance = bal
+                    self.inr_balance = bal
                 elif curr == self.coin:
-                    coin_balance = bal
+                    self.coin_balance = bal
 
         # 2. Precision Rules
         markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
@@ -125,7 +127,7 @@ class GlobalBotEngine:
             
         current_price = float(ticker['last_price'])
 
-        # 4. Fetch Chart Data & Calculate Technical Indicators (15m Timeframe for Maximum Agility)
+        # 4. Fetch Chart Data & Calculate Technical Indicators (15m Timeframe)
         candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=15"
         candles_data = requests.get(candles_url).json()
         
@@ -180,8 +182,8 @@ class GlobalBotEngine:
                 
             actual_cost = buy_crypto_amount * current_price
             
-            if actual_cost > inr_balance:
-                reason_msg = f"AI signaled BUY, but cost (₹{actual_cost:.2f}) exceeds INR balance (₹{inr_balance:.2f})."
+            if actual_cost > self.inr_balance:
+                reason_msg = f"AI signaled BUY, but cost (₹{actual_cost:.2f}) exceeds INR balance (₹{self.inr_balance:.2f})."
                 self.log_trade("BUY SKIPPED", "0", f"₹{actual_cost:.2f}", reason_msg, "Insufficient INR")
             else:
                 formatted_qty = f"{buy_crypto_amount:.{precision}f}"
@@ -200,7 +202,7 @@ class GlobalBotEngine:
                     self.log_trade("BUY FAILED", formatted_qty, f"₹{actual_cost:.2f}", reasoning, f"Rejected: {err}")
 
         elif action == "SELL":
-            sell_crypto_amount = math.floor(coin_balance * multiplier) / multiplier
+            sell_crypto_amount = math.floor(self.coin_balance * multiplier) / multiplier
             actual_value = sell_crypto_amount * current_price
             
             if sell_crypto_amount <= 0:
@@ -229,16 +231,16 @@ class GlobalBotEngine:
 
 # Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v3():
+def get_global_bot_v4():
     return GlobalBotEngine()
 
-bot = get_global_bot_v3()
+bot = get_global_bot_v4()
 
 # ==========================================
 # 4. STREAMLIT UI & LIVE DISPLAY
 # ==========================================
 st.set_page_config(page_title="Global Live AI Bot", layout="wide")
-st.title("🌐 Synchronized Live CoinDCX AI Bot (Optimized)")
+st.title("🌐 Synchronized Live CoinDCX AI Bot")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -266,14 +268,39 @@ with ctrl_col3:
 
 st.divider()
 
-# --- ISOLATED AUTO-REFRESHING FRAGMENT ---
+# --- ISOLATED AUTO-REFRESHING FRAGMENT WITH LIVE WALLET METRICS ---
 @st.fragment(run_every="10s")
 def live_status_board():
+    # Fetch live wallet balances directly for real-time UI visibility
+    live_inr = bot.inr_balance
+    live_coin = bot.coin_balance
+    try:
+        balance_body = {"timestamp": int(round(time.time() * 1000))}
+        balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
+        if isinstance(balances_data, list):
+            for b in balances_data:
+                curr = b.get('currency', '')
+                bal = float(b.get('balance', 0))
+                if curr == 'INR':
+                    live_inr = bal
+                elif curr == coin_input:
+                    live_coin = bal
+    except Exception:
+        pass
+
+    # 1. Live Bot Status Banner
     if bot.is_running:
         st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**, Check Interval: **{bot.check_interval} min**)")
     else:
         st.error("🔴 **GLOBAL STATUS: STOPPED**")
         
+    # 2. Live Wallet Metrics Row (Shows exactly how much INR and Coin you hold)
+    metric_col1, metric_col2 = st.columns(2)
+    with metric_col1:
+        st.metric("💰 Available INR Balance", f"₹{live_inr:,.2f}")
+    with metric_col2:
+        st.metric(f"🪙 Held {coin_input} Quantity", f"{live_coin:,.8f} {coin_input}")
+
     st.subheader("📋 Live Activity Log (IST - Indian Standard Time)")
     
     if not bot.trade_log:
