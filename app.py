@@ -54,7 +54,6 @@ class GoogleSheetsManager:
         self.last_error = None
 
     def connect(self):
-        """Authenticates and initializes worksheets once to avoid API rate limits."""
         try:
             if not st.secrets.get("gcp_service_account"):
                 self.last_error = "Missing [gcp_service_account] in Streamlit Secrets."
@@ -65,13 +64,11 @@ class GoogleSheetsManager:
             self.client = gspread.authorize(creds)
             self.spreadsheet = self.client.open(SHEET_NAME)
 
-            # Setup Trades Sheet (Sheet1)
             self.trades_sheet = self.spreadsheet.sheet1
             if not self.trades_sheet.get_all_values():
                 headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
                 self.trades_sheet.append_row(headers)
 
-            # Setup Logs Sheet (ExecutionLogs)
             try:
                 self.logs_sheet = self.spreadsheet.worksheet("ExecutionLogs")
             except Exception:
@@ -152,7 +149,18 @@ gs_manager = GoogleSheetsManager()
 # 3. PRO-TRADER PORTFOLIO ENGINE
 # ==========================================
 class GlobalBotEngine:
+    # ✨ ZOMBIE KILLER REGISTRY: Tracks running bots
+    _active_instances = []
+
     def __init__(self):
+        # 1. Terminate all old ghost threads before starting a new one
+        for old_bot in GlobalBotEngine._active_instances:
+            old_bot.is_running = False
+        GlobalBotEngine._active_instances.clear()
+        
+        # 2. Register this new bot as the true active bot
+        GlobalBotEngine._active_instances.append(self)
+
         self.is_running = False
         self.trade_log = []
         self.thread = None
@@ -169,7 +177,6 @@ class GlobalBotEngine:
         self.active_positions = {}
         self.last_prices = {}
         
-        # Load permanent memory from Google Sheets on boot
         self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
         self.cooldown_counter = 0
@@ -189,7 +196,6 @@ class GlobalBotEngine:
         if len(self.trade_log) > 100:
             self.trade_log.pop()
             
-        # Push permanent log to Google Sheets asynchronously
         gs_manager.append_log(log_entry)
 
     def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
@@ -220,7 +226,7 @@ class GlobalBotEngine:
             sleep_seconds = int(self.check_interval * 60)
             for _ in range(sleep_seconds):
                 if not self.is_running:
-                    break
+                    break  # Kills the zombie thread immediately
                 time.sleep(1)
 
     def _execute_cycle(self):
@@ -242,9 +248,6 @@ class GlobalBotEngine:
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
-        # ==========================================
-        # RECOVERY (Picks up externally bought coins)
-        # ==========================================
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -257,19 +260,13 @@ class GlobalBotEngine:
                             "entry_price": curr_price,
                             "invested": value
                         }
-                        # Force the bot to log when it finds a new coin!
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected coin in wallet from external trade.", "Wallet Sync")
 
-        # ==========================================
-        # CLEANUP (Removes externally sold coins)
-        # ==========================================
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
-                # Force the bot to log when a coin disappears!
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Coin missing from wallet. Assuming external/manual sell.", "Wallet Sync")
                 del self.active_positions[coin]
 
-        # MANAGE POSITIONS (Pro-Trader AI Exits)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -382,7 +379,6 @@ class GlobalBotEngine:
                         }
                         self.completed_trades.append(trade_record)
                         
-                        # Permanent record in Google Sheets
                         gs_manager.append_trade(trade_record)
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
@@ -521,10 +517,10 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v23():
+def get_bot_engine():
     return GlobalBotEngine()
 
-bot = get_global_bot_v23()
+bot = get_bot_engine()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -587,7 +583,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 23.0 (Sync Detector) • GPT-120B")
+st.sidebar.caption("Version 24.0 (Zombie Killer) • GPT-120B")
 
 
 # ==========================================
@@ -644,7 +640,6 @@ if page == "⚙️ Bot Engine & Settings":
         st.success(f"✅ Connected to Google Sheet (`{SHEET_NAME}`)! Found **Sheet1** (Trades) & **ExecutionLogs** tabs.")
     else:
         st.error(f"❌ Google Sheets Connection Failed: **{gs_manager.last_error}**")
-        st.info("💡 **Fix Steps:** Ensure you shared your Google Sheet with the `client_email` found in your credentials as an **Editor**, and that the Google Sheet document name is exactly `CryptoBotHistory`.")
 
     st.markdown("---")
 
