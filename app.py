@@ -40,7 +40,7 @@ def coindcx_auth_post(endpoint, body):
     return requests.post(url, data=json_body, headers=headers).json()
 
 # ==========================================
-# 3. GLOBAL SHARED BOT ENGINE
+# 3. GLOBAL SHARED BOT ENGINE (OPTIMIZED)
 # ==========================================
 class GlobalBotEngine:
     def __init__(self):
@@ -125,23 +125,33 @@ class GlobalBotEngine:
             
         current_price = float(ticker['last_price'])
 
-        # 4. Fetch Chart Data for AI
-        candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=1h&limit=10"
+        # 4. Fetch Chart Data & Calculate Technical Indicators (15m Timeframe for Maximum Agility)
+        candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=15"
         candles_data = requests.get(candles_url).json()
         
         df = pd.DataFrame(candles_data)
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         df = df.sort_values(by='time', ascending=True)
-        market_data_str = df[['time', 'open', 'high', 'low', 'close', 'volume']].to_string(index=False)
-
-        # 5. Ask Groq AI
-        client = Groq(api_key=GROQ_API_KEY)
-        system_prompt = """You are a highly analytical crypto trading bot. 
-        You MUST respond ONLY with a valid JSON object containing:
-        "action": strictly "BUY", "SELL", or "HOLD".
-        "reasoning": a brief 1-sentence explanation based on the price data provided."""
         
-        user_prompt = f"Analyze the last 10 hours of market data for {market_symbol}:\n\n{market_data_str}"
+        # Add Technical Indicators (EMA & Price Momentum)
+        df['close'] = df['close'].astype(float)
+        df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()
+        df['Price_Change_%'] = df['close'].pct_change() * 100
+        
+        market_data_str = df[['time', 'close', 'EMA_5', 'Price_Change_%']].tail(10).to_string(index=False)
+
+        # 5. Ask Groq AI (Optimized Hedge Fund Prompt)
+        client = Groq(api_key=GROQ_API_KEY)
+        system_prompt = """You are an elite, hyper-conservative algorithmic crypto hedge fund manager focused on profit compounding. 
+        Analyze the provided price action, exponential moving average (EMA_5), and momentum percentage (% change).
+        - Output 'BUY' only if momentum and EMA indicate an upward trend.
+        - Output 'SELL' if momentum is breaking down or profits should be secured.
+        - Default to 'HOLD' if the trend is sideways or unclear.
+        You MUST respond ONLY with a valid JSON object containing:
+        "action": strictly "BUY", "SELL", or "HOLD",
+        "reasoning": a brief 1-sentence analytical explanation."""
+        
+        user_prompt = f"Analyze market metrics for {market_symbol}:\n\n{market_data_str}"
         
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -217,18 +227,18 @@ class GlobalBotEngine:
             self.log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
 
 
-# Cache instance globally across ALL web sessions (v2 prevents ghost threads)
+# Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v2():
+def get_global_bot_v3():
     return GlobalBotEngine()
 
-bot = get_global_bot_v2()
+bot = get_global_bot_v3()
 
 # ==========================================
 # 4. STREAMLIT UI & LIVE DISPLAY
 # ==========================================
 st.set_page_config(page_title="Global Live AI Bot", layout="wide")
-st.title("🌐 Synchronized Live CoinDCX AI Bot")
+st.title("🌐 Synchronized Live CoinDCX AI Bot (Optimized)")
 
 col1, col2, col3 = st.columns(3)
 with col1:
