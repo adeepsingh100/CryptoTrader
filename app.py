@@ -52,6 +52,7 @@ class GlobalBotEngine:
         self.check_interval = 5
 
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
+        ist_timezone = timezone(timedelta(hours=5, minutes=30))
         log_entry = {
             "Time": datetime.now(ist_timezone).strftime("%I:%M:%S %p"),
             "Action": action,
