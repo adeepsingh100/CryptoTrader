@@ -29,7 +29,6 @@ except Exception:
 HISTORY_FILE = "trades_history.json"
 
 def load_trade_history():
-    """Loads historical trade data from persistent disk storage."""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r") as f:
@@ -39,7 +38,6 @@ def load_trade_history():
     return []
 
 def save_trade_history(completed_trades):
-    """Saves completed trade history to local disk storage."""
     try:
         with open(HISTORY_FILE, "w") as f:
             json.dump(completed_trades, f, indent=2)
@@ -47,7 +45,6 @@ def save_trade_history(completed_trades):
         pass
 
 def coindcx_auth_post(endpoint, body):
-    """Signs and sends authenticated requests to CoinDCX."""
     url = f"https://api.coindcx.com{endpoint}"
     secret_bytes = bytes(API_SECRET, 'utf-8')
     json_body = json.dumps(body, separators=(',', ':'))
@@ -69,7 +66,6 @@ class GlobalBotEngine:
         self.trade_log = []
         self.thread = None
         
-        # User defined rules
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.max_budget = 500.0
         self.trade_amount = 110.0
@@ -77,11 +73,10 @@ class GlobalBotEngine:
         self.sl_pct = 3.0
         self.check_interval = 5
         
-        # Internal State Management
         self.inr_balance = 0.0
-        self.active_positions = {}  # Format: {'BTC': {'qty': 0.01, 'entry_price': 50000, 'invested': 110}}
-        self.last_prices = {}       # Live prices stored for UI dashboard
-        self.completed_trades = load_trade_history()  # Load 2-year history from file
+        self.active_positions = {}
+        self.last_prices = {}
+        self.completed_trades = load_trade_history()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
         self.cooldown_counter = 0
 
@@ -128,7 +123,7 @@ class GlobalBotEngine:
                 time.sleep(1)
 
     def _execute_cycle(self):
-        # 1. Fetch Actual Balances (Ghost Recovery Sync)
+        # 1. Fetch Actual Balances
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
@@ -148,26 +143,26 @@ class GlobalBotEngine:
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
-        # RECOVERY LOGIC: If app restarted, re-add existing coins to budget tracking
+        # RECOVERY LOGIC
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
                 curr_price = self.last_prices.get(market)
                 if curr_price:
                     value = actual_balances[coin] * curr_price
-                    if value > 50: # Only track if holding more than ₹50 worth
+                    if value > 50:
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
                             "invested": value
                         }
 
-        # CLEANUP: Remove coins from tracker if user manually sold them in the CoinDCX app
+        # CLEANUP
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 del self.active_positions[coin]
 
-        # 3. MANAGE HELD POSITIONS (Auto Take-Profit & Stop-Loss)
+        # 3. MANAGE HELD POSITIONS (Math TP/SL + AI Peak Selling)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -176,10 +171,67 @@ class GlobalBotEngine:
             pos = self.active_positions[coin]
             pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
             
-            # TRIGGER: Execute strict math-based sell
-            if pnl_pct >= self.tp_pct or pnl_pct <= -self.sl_pct:
-                action_type = "TAKE PROFIT" if pnl_pct >= self.tp_pct else "STOP LOSS"
-                reasoning = f"{action_type} activated at {pnl_pct:.2f}%."
+            # Check RSI for AI Selling
+            candle_pair = f"I-{coin}_INR"
+            ai_sell_signal = False
+            ai_reason = ""
+            
+            try:
+                url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=30"
+                candles_data = requests.get(url).json()
+                df = pd.DataFrame(candles_data)
+                df['close'] = df['close'].astype(float)
+                df = df.sort_values(by='time', ascending=True)
+                
+                delta = df['close'].diff()
+                gain = delta.clip(lower=0)
+                loss = -1 * delta.clip(upper=0)
+                avg_gain = gain.rolling(window=14).mean()
+                avg_loss = loss.rolling(window=14).mean()
+                rs = avg_gain / avg_loss
+                df['RSI'] = 100 - (100 / (1 + rs))
+                
+                latest_rsi = df['RSI'].iloc[-1]
+                
+                # If RSI is overbought (> 60), consult AI for a dynamic SELL signal
+                if latest_rsi > 60:
+                    df['time'] = pd.to_datetime(df['time'], unit='ms')
+                    df_str = df[['time', 'close', 'RSI']].tail(10).to_string(index=False)
+                    
+                    client = Groq(api_key=GROQ_API_KEY)
+                    sell_prompt = """You are managing a currently HELD crypto position.
+                    Analyze the market metrics:
+                    - If RSI is above 60/overbought, output 'SELL' to take profit at the peak.
+                    - Otherwise, output 'HOLD'.
+                    Respond ONLY with JSON: {"action": "SELL" or "HOLD", "reasoning": "1 sentence explanation"}"""
+                    
+                    response = client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
+                        messages=[
+                            {"role": "system", "content": sell_prompt},
+                            {"role": "user", "content": f"Held coin {market} metrics:\n\n{df_str}"}
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.1
+                    )
+                    decision_data = json.loads(response.choices[0].message.content)
+                    if decision_data.get("action", "").upper() == "SELL":
+                        ai_sell_signal = True
+                        ai_reason = decision_data.get("reasoning", "AI triggered peak sell.")
+            except Exception:
+                pass
+
+            # TRIGGER: Math TP/SL OR AI Peak Sell Signal
+            is_tp = pnl_pct >= self.tp_pct
+            is_sl = pnl_pct <= -self.sl_pct
+            
+            if is_tp or is_sl or ai_sell_signal:
+                if is_tp:
+                    action_type, reasoning = "TAKE PROFIT", f"Take-Profit triggered at +{pnl_pct:.2f}%."
+                elif is_sl:
+                    action_type, reasoning = "STOP LOSS", f"Stop-Loss triggered at {pnl_pct:.2f}%."
+                else:
+                    action_type, reasoning = "AI SELL", ai_reason
                 
                 precision = market_precision.get(market, 5)
                 multiplier = 10 ** precision
@@ -200,7 +252,6 @@ class GlobalBotEngine:
                         profit_inr = actual_value - pos['invested']
                         self.realized_pnl += profit_inr
                         
-                        # Store trade record & persist to local disk history
                         trade_record = {
                             "timestamp": time.time(),
                             "coin": coin,
@@ -216,7 +267,7 @@ class GlobalBotEngine:
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                         del self.active_positions[coin]
-                        self.cooldown_counter = 2 # Rest for a few cycles
+                        self.cooldown_counter = 2
                         return
                     else:
                         err = res.get("message", "API Error")
@@ -229,9 +280,7 @@ class GlobalBotEngine:
         # 4. LOOK FOR NEW OPPORTUNITIES (Multi-Coin Auto-Scanning)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
-        # STRICT BUDGET LOCK: Only buy if total invested + new trade fits inside Max Budget
         if (current_invested + self.trade_amount) <= self.max_budget:
-            
             lowest_rsi = 100
             best_coin = None
             best_market = None
@@ -253,7 +302,6 @@ class GlobalBotEngine:
                     df['close'] = df['close'].astype(float)
                     df = df.sort_values(by='time', ascending=True)
                     
-                    # Calculate RSI
                     delta = df['close'].diff()
                     gain = delta.clip(lower=0)
                     loss = -1 * delta.clip(upper=0)
@@ -274,15 +322,13 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # 5. AI VERIFICATION
+            # 5. AI BUY VERIFICATION (Scans candidates to BUY)
             if best_coin and lowest_rsi < 45:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are an elite crypto hedge fund bot evaluating an OVERSOLD coin.
+                system_prompt = """You are evaluating an OVERSOLD candidate coin to BUY.
                 - If RSI is strictly below 40, output 'BUY' to buy the dip.
                 - If RSI is recovering or above 40, output 'HOLD'.
-                You MUST respond ONLY with a valid JSON object containing:
-                "action": strictly "BUY" or "HOLD",
-                "reasoning": a brief 1-sentence analytical explanation mentioning the RSI."""
+                Respond ONLY with JSON: {"action": "BUY" or "HOLD", "reasoning": "1 sentence explanation"}"""
                 
                 try:
                     response = client.chat.completions.create(
@@ -298,7 +344,6 @@ class GlobalBotEngine:
                     action = decision_data.get("action", "HOLD").upper()
                     reasoning = decision_data.get("reasoning", "No reason provided.")
 
-                    # 6. EXECUTE AUTO-BUY
                     if action == "BUY":
                         precision = market_precision.get(best_market, 5)
                         multiplier = 10 ** precision
@@ -338,12 +383,11 @@ class GlobalBotEngine:
                     pass
 
 
-# Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v11():
+def get_global_bot_v12():
     return GlobalBotEngine()
 
-bot = get_global_bot_v11()
+bot = get_global_bot_v12()
 
 # ==========================================
 # 4. STREAMLIT UI & PORTFOLIO DASHBOARD
@@ -361,7 +405,7 @@ with st.expander("⚙️ Autopilot Configuration & Start", expanded=not bot.is_r
         max_bud = st.number_input("Max Total Portfolio Budget (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
         tp_pct = st.number_input("Auto Take-Profit (%)", min_value=0.5, value=float(bot.tp_pct), step=0.5)
     with colB:
-        trade_amt = st.number_input("Trade Size Per Coin (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0, help="CoinDCX minimum order is ₹100. Use ₹105+ to be safe.")
+        trade_amt = st.number_input("Trade Size Per Coin (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
         sl_pct = st.number_input("Auto Stop-Loss (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
     interval_input = st.number_input("Scan Market Every (Minutes)", min_value=1, value=int(bot.check_interval))
@@ -408,7 +452,6 @@ def live_status_board():
 
     two_years_ago = now_ist - timedelta(days=730)
 
-    # Performance Bucket Containers
     period_stats = {
         "today": {"profit": 0.0, "loss": 0.0, "count": 0},
         "yesterday": {"profit": 0.0, "loss": 0.0, "count": 0},
@@ -417,37 +460,31 @@ def live_status_board():
         "all_time": {"profit": 0.0, "loss": 0.0, "count": 0}
     }
 
-    # Process all historical trades
     for trade in bot.completed_trades:
         trade_dt_ist = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset
         trade_date = trade_dt_ist.date()
         pnl = trade.get("pnl", 0.0)
 
         if trade_dt_ist >= two_years_ago:
-            # 2-Year Lifetime
             if pnl >= 0: period_stats["all_time"]["profit"] += pnl
             else: period_stats["all_time"]["loss"] += abs(pnl)
             period_stats["all_time"]["count"] += 1
 
-            # Today
             if trade_date == today_date_ist:
                 if pnl >= 0: period_stats["today"]["profit"] += pnl
                 else: period_stats["today"]["loss"] += abs(pnl)
                 period_stats["today"]["count"] += 1
 
-            # Yesterday
             if trade_date == yesterday_date_ist:
                 if pnl >= 0: period_stats["yesterday"]["profit"] += pnl
                 else: period_stats["yesterday"]["loss"] += abs(pnl)
                 period_stats["yesterday"]["count"] += 1
 
-            # This Month
             if trade_dt_ist.year == current_year and trade_dt_ist.month == current_month:
                 if pnl >= 0: period_stats["this_month"]["profit"] += pnl
                 else: period_stats["this_month"]["loss"] += abs(pnl)
                 period_stats["this_month"]["count"] += 1
 
-            # Last Month
             if trade_dt_ist.year == last_month_year and trade_dt_ist.month == last_month_num:
                 if pnl >= 0: period_stats["last_month"]["profit"] += pnl
                 else: period_stats["last_month"]["loss"] += abs(pnl)
@@ -496,7 +533,7 @@ def live_status_board():
 
     st.divider()
 
-    # --- Live Active Positions Table ---
+    # --- Active Portfolio Table ---
     st.subheader("💼 Active Portfolio Positions")
     if not bot.active_positions:
         st.info("No active positions held. Waiting for AI to find the perfect dip...")
