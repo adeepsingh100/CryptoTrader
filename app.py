@@ -321,40 +321,40 @@ st.divider()
 
 # --- ISOLATED AUTO-REFRESHING FRAGMENT ---
 @st.fragment(run_every="10s")
-def live_status_board():
-    if bot.is_running:
-        st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**, Check Interval: **{bot.check_interval} min**)")
-    else:
-        st.error("🔴 **GLOBAL STATUS: STOPPED**")
+    def live_status_board():
+        if bot.is_running:
+            st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**, Check Interval: **{bot.check_interval} min**)")
+        else:
+            st.error("🔴 **GLOBAL STATUS: STOPPED**")
+            
+        st.subheader("📋 Live Activity Log (IST - India Local Time)")
         
-    st.subheader("📋 Live Activity Log (IST - India Local Time)")
+        if not bot.trade_log:
+            st.info("No activity recorded yet.")
+        else:
+            # Convert raw timestamps to Indian Standard Time (+5:30) at UI render time
+            formatted_logs = []
+            ist_offset = timedelta(hours=5, minutes=30)
+            
+            for entry in bot.trade_log:
+                e = entry.copy()
+                if "timestamp" in e:
+                    utc_dt = datetime.fromtimestamp(e["timestamp"], tz=timezone.utc)
+                    ist_dt = utc_dt + ist_offset
+                    e["Time (IST)"] = ist_dt.strftime("%I:%M:%S %p")
+                    del e["timestamp"]
+                elif "Time" in e:
+                    e["Time (IST)"] = e["Time"]
+                    del e["Time"]
+                formatted_logs.append(e)
+                
+            df_logs = pd.DataFrame(formatted_logs)
+            
+            # Ensure Time column is always displayed first
+            if "Time (IST)" in df_logs.columns:
+                cols = ["Time (IST)"] + [c for c in df_logs.columns if c != "Time (IST)"]
+                df_logs = df_logs[cols]
+                
+            st.dataframe(df_logs, use_container_width=True, hide_index=True)
     
-    if not bot.trade_log:
-        st.info("No activity recorded yet.")
-    else:
-        # Convert raw timestamps to Indian Standard Time (+5:30) at UI render time
-        formatted_logs = []
-        ist_offset = timedelta(hours=5, minutes=30)
-        
-        for entry in bot.trade_log:
-            e = entry.copy()
-            if "timestamp" in e:
-                utc_dt = datetime.fromtimestamp(e["timestamp"], tz=timezone.utc)
-                ist_dt = utc_dt + ist_offset
-                e["Time (IST)"] = ist_dt.strftime("%I:%M:%S %p")
-                del e["timestamp"]
-            elif "Time" in e:
-                e["Time (IST)"] = e["Time"]
-                del e["Time"]
-            formatted_logs.append(e)
-            
-        df_logs = pd.DataFrame(formatted_logs)
-        
-        # Ensure Time column is always displayed first
-        if "Time (IST)" in df_logs.columns:
-            cols = ["Time (IST)"] + [c for c in df_logs.columns if c != "Time (IST)"]
-            df_logs = df_logs[cols]
-            
-        st.dataframe(df_logs, use_container_width=True, hide_index=True)
-
-live_status_board()
+    live_status_board()
