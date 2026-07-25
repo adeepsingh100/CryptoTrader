@@ -91,6 +91,10 @@ class GlobalBotEngine:
             "Status": status
         }
         self.trade_log.insert(0, log_entry)
+        
+        # Keep UI fast by only storing the last 100 thoughts/actions in memory
+        if len(self.trade_log) > 100:
+            self.trade_log.pop()
 
     def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval):
         if not self.is_running:
@@ -162,7 +166,7 @@ class GlobalBotEngine:
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 del self.active_positions[coin]
 
-        # 3. MANAGE HELD POSITIONS (Math TP/SL + AI Peak Selling)
+        # 3. MANAGE HELD POSITIONS
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -170,8 +174,9 @@ class GlobalBotEngine:
             
             pos = self.active_positions[coin]
             pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
+            curr_val = pos['qty'] * curr_price
             
-            # Check RSI for AI Selling
+            # Check RSI for AI Selling Peak
             candle_pair = f"I-{coin}_INR"
             ai_sell_signal = False
             ai_reason = ""
@@ -193,14 +198,13 @@ class GlobalBotEngine:
                 
                 latest_rsi = df['RSI'].iloc[-1]
                 
-                # If RSI is overbought (> 60), consult AI for a dynamic SELL signal
+                # If overbought, ask AI if we should sell early
                 if latest_rsi > 60:
                     df['time'] = pd.to_datetime(df['time'], unit='ms')
                     df_str = df[['time', 'close', 'RSI']].tail(10).to_string(index=False)
                     
                     client = Groq(api_key=GROQ_API_KEY)
                     sell_prompt = """You are managing a currently HELD crypto position.
-                    Analyze the market metrics:
                     - If RSI is above 60/overbought, output 'SELL' to take profit at the peak.
                     - Otherwise, output 'HOLD'.
                     Respond ONLY with JSON: {"action": "SELL" or "HOLD", "reasoning": "1 sentence explanation"}"""
@@ -218,6 +222,9 @@ class GlobalBotEngine:
                     if decision_data.get("action", "").upper() == "SELL":
                         ai_sell_signal = True
                         ai_reason = decision_data.get("reasoning", "AI triggered peak sell.")
+                    else:
+                        # Log the AI's thought process if it decided to hold an overbought coin
+                        self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI holding peak."), "Holding Peak")
             except Exception:
                 pass
 
@@ -322,7 +329,7 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # 5. AI BUY VERIFICATION (Scans candidates to BUY)
+            # 5. SCANNER OR AI BUY VERIFICATION
             if best_coin and lowest_rsi < 45:
                 client = Groq(api_key=GROQ_API_KEY)
                 system_prompt = """You are evaluating an OVERSOLD candidate coin to BUY.
@@ -379,15 +386,26 @@ class GlobalBotEngine:
                             else:
                                 err = res.get("message", "API Error")
                                 self.log_trade("BUY FAILED", best_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
+                    else:
+                        # Log that AI actively chose to skip this dip
+                        self.log_trade("AI HOLD", best_coin, "0", f"₹{best_price:.2f}", reasoning, "AI Skipped Dip")
                 except Exception:
                     pass
+            else:
+                # Log that the scanner found absolutely nothing worth buying
+                display_coin = best_coin if best_coin else "N/A"
+                display_rsi = lowest_rsi if lowest_rsi != 100 else 0
+                self.log_trade("SCAN HOLD", display_coin, "0", f"₹{best_price:.2f}", f"Lowest RSI is {display_rsi:.1f}. Waiting for a drop below 45.", "Market Too High")
+        else:
+            # Log that the budget is full
+            self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 
 @st.cache_resource
-def get_global_bot_v12():
+def get_global_bot_v13():
     return GlobalBotEngine()
 
-bot = get_global_bot_v12()
+bot = get_global_bot_v13()
 
 # ==========================================
 # 4. STREAMLIT UI & PORTFOLIO DASHBOARD
@@ -577,7 +595,7 @@ def live_status_board():
         st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
 
     # --- Live Activity Logs ---
-    st.subheader("📋 Real-Time Activity Log")
+    st.subheader("📋 Real-Time Activity Log (Live Heartbeat)")
     if not bot.trade_log:
         st.caption("No session activity recorded yet.")
     else:
