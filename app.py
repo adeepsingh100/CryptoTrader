@@ -9,7 +9,6 @@ import math
 import threading
 from groq import Groq
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
 # ==========================================
 # 1. SECURE API KEYS (From Streamlit Secrets)
@@ -51,9 +50,9 @@ class GlobalBotEngine:
         self.coin = "BTC"
         self.trade_amount_inr = 150.0
         self.check_interval = 5
-    
+
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
-        # Store raw UTC timestamp so display formatting is always accurate
+        # Store raw UTC epoch timestamp so UI renders IST accurately
         log_entry = {
             "timestamp": time.time(),
             "Action": action,
@@ -218,53 +217,15 @@ class GlobalBotEngine:
             self.log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
 
 
-# Cache instance globally across ALL web sessions/users
-import streamlit as st
-import pandas as pd
-import json
-import time
-import hmac
-import hashlib
-import requests
-import math
-import threading
-from groq import Groq
-from datetime import datetime, timezone, timedelta
-
-# ... [API keys and coindcx_auth_post remain unchanged] ...
-
-class GlobalBotEngine:
-    def __init__(self):
-        self.is_running = False
-        self.trade_log = []
-        self.thread = None
-        self.coin = "BTC"
-        self.trade_amount_inr = 150.0
-        self.check_interval = 5
-
-    def log_trade(self, action, crypto_amt, inr_budget, reason, status):
-        # Store raw UTC timestamp so display formatting is always accurate
-        log_entry = {
-            "timestamp": time.time(),
-            "Action": action,
-            "Quantity": crypto_amt,
-            "Target Budget / Value": inr_budget,
-            "Reasoning": reason,
-            "Status": status
-        }
-        self.trade_log.insert(0, log_entry)
-
-    # ... [rest of GlobalBotEngine remains unchanged] ...
-
-
+# Cache instance globally across ALL web sessions (v2 prevents ghost threads)
 @st.cache_resource
-def get_global_bot():
+def get_global_bot_v2():
     return GlobalBotEngine()
 
-bot = get_global_bot()
+bot = get_global_bot_v2()
 
 # ==========================================
-# STREAMLIT UI & LIVE DISPLAY
+# 4. STREAMLIT UI & LIVE DISPLAY
 # ==========================================
 st.set_page_config(page_title="Global Live AI Bot", layout="wide")
 st.title("🌐 Synchronized Live CoinDCX AI Bot")
@@ -303,12 +264,12 @@ def live_status_board():
     else:
         st.error("🔴 **GLOBAL STATUS: STOPPED**")
         
-    st.subheader("📋 Live Activity Log (IST - India Local Time)")
+    st.subheader("📋 Live Activity Log (IST - Indian Standard Time)")
     
     if not bot.trade_log:
         st.info("No activity recorded yet.")
     else:
-        # Convert raw timestamps to Indian Standard Time (+5:30) at UI render time
+        # Convert raw UTC timestamps to Indian Standard Time (+5:30) live on render
         formatted_logs = []
         ist_offset = timedelta(hours=5, minutes=30)
         
@@ -319,9 +280,6 @@ def live_status_board():
                 ist_dt = utc_dt + ist_offset
                 e["Time (IST)"] = ist_dt.strftime("%I:%M:%S %p")
                 del e["timestamp"]
-            elif "Time" in e:
-                e["Time (IST)"] = e["Time"]
-                del e["Time"]
             formatted_logs.append(e)
             
         df_logs = pd.DataFrame(formatted_logs)
@@ -334,4 +292,3 @@ def live_status_board():
         st.dataframe(df_logs, use_container_width=True, hide_index=True)
 
 live_status_board()
-        
