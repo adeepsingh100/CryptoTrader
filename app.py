@@ -59,8 +59,9 @@ class GlobalBotEngine:
         # Internal State Management
         self.inr_balance = 0.0
         self.active_positions = {}  # Format: {'BTC': {'qty': 0.01, 'entry_price': 50000, 'invested': 110}}
-        self.last_prices = {}       # Live prices stored for the UI dashboard
-        self.realized_pnl = 0.0
+        self.last_prices = {}       # Live prices stored for UI dashboard
+        self.completed_trades = []  # Stores closed trades for 24h P&L math
+        self.realized_pnl = 0.0     # All-time session PnL
         self.cooldown_counter = 0
 
     def log_trade(self, action, coin, qty, value, reason, status):
@@ -177,10 +178,18 @@ class GlobalBotEngine:
                     if "orders" in res or "id" in res:
                         profit_inr = actual_value - pos['invested']
                         self.realized_pnl += profit_inr
+                        
+                        # Store trade record for 24-hour daily P&L calculations
+                        self.completed_trades.append({
+                            "timestamp": time.time(),
+                            "coin": coin,
+                            "pnl": profit_inr
+                        })
+                        
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                         del self.active_positions[coin]
-                        self.cooldown_counter = 2 # Rest for a few cycles after a big move
-                        return # Only do one major action per cycle to prevent rate-limits
+                        self.cooldown_counter = 2 # Rest for a few cycles
+                        return
                     else:
                         err = res.get("message", "API Error")
                         self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{actual_value:.2f}", f"Rejected: {err}", "Error")
@@ -201,9 +210,8 @@ class GlobalBotEngine:
             best_price = 0
             best_df_str = ""
 
-            # Scan all candidate coins
             for coin in self.candidates:
-                if coin in self.active_positions: continue # Don't buy a coin we already hold
+                if coin in self.active_positions: continue
                 
                 market = f"{coin}INR"
                 curr_price = self.last_prices.get(market)
@@ -228,7 +236,6 @@ class GlobalBotEngine:
                     
                     latest_rsi = df['RSI'].iloc[-1]
                     
-                    # Find the absolute CHEAPEST (most oversold) coin right now
                     if not pd.isna(latest_rsi) and latest_rsi < lowest_rsi:
                         lowest_rsi = latest_rsi
                         best_coin = coin
@@ -239,10 +246,10 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # 5. AI VERIFICATION (Only feed the best coin to the AI)
-            if best_coin and lowest_rsi < 45: # Only bother the AI if it's actually a dip
+            # 5. AI VERIFICATION
+            if best_coin and lowest_rsi < 45:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are an elite crypto hedge fund bot. You are evaluating the most OVERSOLD coin currently detected by the scanner.
+                system_prompt = """You are an elite crypto hedge fund bot evaluating an OVERSOLD coin.
                 - If RSI is strictly below 40, output 'BUY' to buy the dip.
                 - If RSI is recovering or above 40, output 'HOLD'.
                 You MUST respond ONLY with a valid JSON object containing:
@@ -289,7 +296,6 @@ class GlobalBotEngine:
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
-                                # Lock in the budget and cost
                                 self.active_positions[best_coin] = {
                                     "qty": buy_crypto_amount,
                                     "entry_price": best_price,
@@ -300,16 +306,16 @@ class GlobalBotEngine:
                             else:
                                 err = res.get("message", "API Error")
                                 self.log_trade("BUY FAILED", best_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
-                except Exception as e:
+                except Exception:
                     pass
 
 
 # Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v9():
+def get_global_bot_v10():
     return GlobalBotEngine()
 
-bot = get_global_bot_v9()
+bot = get_global_bot_v10()
 
 # ==========================================
 # 4. STREAMLIT UI & PORTFOLIO DASHBOARD
@@ -317,7 +323,6 @@ bot = get_global_bot_v9()
 st.set_page_config(page_title="AI Portfolio Manager", layout="wide")
 st.title("🌐 Fully Autonomous AI Portfolio Manager")
 
-# Settings Expander (Collapses automatically when bot is running)
 with st.expander("⚙️ Autopilot Configuration & Start", expanded=not bot.is_running):
     st.info("The bot will automatically scan the coins below, select the best dips, and trade automatically within your Max Budget limit.")
     
@@ -343,8 +348,9 @@ with st.expander("⚙️ Autopilot Configuration & Start", expanded=not bot.is_r
             bot.stop()
             st.rerun()
     with ctrl_col3:
-        if st.button("🧹 CLEAR LOGS", use_container_width=True):
+        if st.button("🧹 CLEAR LOGS & HISTORY", use_container_width=True):
             bot.trade_log.clear()
+            bot.completed_trades.clear()
             st.rerun()
 
 st.divider()
@@ -357,18 +363,46 @@ def live_status_board():
     else:
         st.error("🔴 **BOT STOPPED**")
         
-    # --- Top Portfolio Metrics ---
+    # --- CALCULATE 24-HOUR / TODAY'S P&L (IST TIMEZONE) ---
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = datetime.now(timezone.utc) + ist_offset
+    today_date_ist = now_ist.date()
+
+    today_profit = 0.0
+    today_loss = 0.0
+
+    for trade in bot.completed_trades:
+        trade_time_ist = (datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset).date()
+        if trade_time_ist == today_date_ist:
+            if trade["pnl"] >= 0:
+                today_profit += trade["pnl"]
+            else:
+                today_loss += abs(trade["pnl"])
+
+    today_net_pnl = today_profit - today_loss
+
+    # --- TOP WALLET & BUDGET METRICS ---
     current_invested = sum(p['invested'] for p in bot.active_positions.values())
     unrealized_pnl = 0.0
     for coin, pos in bot.active_positions.items():
         live_p = bot.last_prices.get(f"{coin}INR", pos['entry_price'])
         unrealized_pnl += (pos['qty'] * live_p) - pos['invested']
 
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    st.subheader("📊 Live Account Summary")
+    metric_col1, metric_col2, metric_col3 = st.columns(3)
     metric_col1.metric("💰 Available INR Wallet", f"₹{bot.inr_balance:,.2f}")
     metric_col2.metric("💳 Budget Utilized", f"₹{current_invested:,.2f}", f"of ₹{bot.max_budget:,.2f} Max", delta_color="off")
-    metric_col3.metric("📈 Unrealized PnL", f"₹{unrealized_pnl:,.2f}", f"{(unrealized_pnl/current_invested*100):.2f}%" if current_invested else "0.00%")
-    metric_col4.metric("🏦 Realized Profit (Session)", f"₹{bot.realized_pnl:,.2f}")
+    metric_col3.metric("📈 Open Positions PnL", f"₹{unrealized_pnl:,.2f}", f"{(unrealized_pnl/current_invested*100):.2f}%" if current_invested else "0.00%")
+
+    # --- 24-HOUR TODAY'S PERFORMANCE ROW ---
+    st.markdown("##### 📅 Today's Performance (Resets Daily at Midnight IST)")
+    day_col1, day_col2, day_col3, day_col4 = st.columns(4)
+    day_col1.metric("🟢 Today's Profit", f"₹{today_profit:,.2f}")
+    day_col2.metric("🔴 Today's Loss", f"₹{today_loss:,.2f}")
+    day_col3.metric("⚖️ Today's Net P&L", f"₹{today_net_pnl:,.2f}", delta=f"₹{today_net_pnl:,.2f}")
+    day_col4.metric("🏦 Session Total Realized", f"₹{bot.realized_pnl:,.2f}")
+
+    st.divider()
 
     # --- Live Active Positions Table ---
     st.subheader("💼 Active Portfolio Positions")
@@ -399,7 +433,6 @@ def live_status_board():
         st.caption("No activity recorded yet.")
     else:
         formatted_logs = []
-        ist_offset = timedelta(hours=5, minutes=30)
         
         for entry in bot.trade_log:
             e = entry.copy()
