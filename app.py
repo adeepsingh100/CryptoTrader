@@ -7,6 +7,7 @@ import hashlib
 import requests
 import math
 import threading
+import os
 from groq import Groq
 from datetime import datetime, timezone, timedelta
 
@@ -40,99 +41,113 @@ def coindcx_auth_post(endpoint, body):
     return requests.post(url, data=json_body, headers=headers).json()
 
 # ==========================================
-# 2. GOOGLE SHEETS PERMANENT STORAGE HELPERS
+# 2. CACHED & RELIABLE GOOGLE SHEETS MANAGER
 # ==========================================
 SHEET_NAME = "CryptoBotHistory"
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-def get_gspread_client():
-    """Authenticates using the credentials in Streamlit Secrets"""
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
-    return gspread.authorize(creds)
+class GoogleSheetsManager:
+    def __init__(self):
+        self.client = None
+        self.spreadsheet = None
+        self.trades_sheet = None
+        self.logs_sheet = None
+        self.last_error = None
 
-def init_sheet_headers(sheet):
-    """Adds column headers if the trade sheet is completely blank"""
-    if not sheet.get_all_values():
-        headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
-        sheet.append_row(headers)
+    def connect(self):
+        """Authenticates and initializes worksheets once to avoid API rate limits."""
+        try:
+            if not st.secrets.get("gcp_service_account"):
+                self.last_error = "Missing [gcp_service_account] in Streamlit Secrets."
+                return False
 
-def load_trade_history_from_sheets():
-    """Loads all historical trades from Google Sheets into bot memory"""
-    try:
-        client = get_gspread_client()
-        sheet = client.open(SHEET_NAME).sheet1
-        init_sheet_headers(sheet)
-        records = sheet.get_all_records()
-        
-        parsed_records = []
-        for row in records:
-            parsed_records.append({
-                "timestamp": float(row.get("timestamp", 0)),
-                "coin": str(row.get("coin", "")),
-                "entry_price": float(row.get("entry_price", 0)),
-                "exit_price": float(row.get("exit_price", 0)),
-                "invested": float(row.get("invested", 0)),
-                "pnl": float(row.get("pnl", 0)),
-                "pnl_pct": float(row.get("pnl_pct", 0)),
-                "type": str(row.get("type", "CLOSE"))
-            })
-        return parsed_records
-    except Exception as e:
-        print(f"Google Sheets Load Error: {e}")
-        return []
+            creds_dict = dict(st.secrets["gcp_service_account"])
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+            self.client = gspread.authorize(creds)
+            self.spreadsheet = self.client.open(SHEET_NAME)
 
-def append_trade_to_sheets(trade_record):
-    """Pushes a newly closed trade to Sheet1"""
-    try:
-        client = get_gspread_client()
-        sheet = client.open(SHEET_NAME).sheet1
-        row = [
-            trade_record["timestamp"],
-            trade_record["coin"],
-            trade_record["entry_price"],
-            trade_record["exit_price"],
-            trade_record["invested"],
-            trade_record["pnl"],
-            trade_record["pnl_pct"],
-            trade_record.get("type", "CLOSE")
-        ]
-        sheet.append_row(row)
-    except Exception as e:
-        print(f"Google Sheets Save Error: {e}")
+            # Setup Trades Sheet (Sheet1)
+            self.trades_sheet = self.spreadsheet.sheet1
+            if not self.trades_sheet.get_all_values():
+                headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
+                self.trades_sheet.append_row(headers)
 
-def append_log_to_sheets(log_entry):
-    """Pushes AI thoughts and execution logs to a separate tab in Google Sheets"""
-    try:
-        client = get_gspread_client()
-        spreadsheet = client.open(SHEET_NAME)
-        
-        # Check if "ExecutionLogs" tab exists. If not, create it.
-        sheet_list = [s.title for s in spreadsheet.worksheets()]
-        if "ExecutionLogs" in sheet_list:
-            worksheet = spreadsheet.worksheet("ExecutionLogs")
-        else:
-            worksheet = spreadsheet.add_worksheet("ExecutionLogs", rows=1000, cols=7)
-            headers = ["Time (IST)", "Action", "Coin", "Quantity", "Value (INR)", "Reasoning", "Status"]
-            worksheet.append_row(headers)
-            
-        # Convert timestamp to human-readable IST for the spreadsheet
-        ist_offset = timedelta(hours=5, minutes=30)
-        utc_dt = datetime.fromtimestamp(log_entry["timestamp"], tz=timezone.utc)
-        ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
-        
-        row = [
-            ist_time,
-            log_entry["Action"],
-            log_entry["Coin"],
-            str(log_entry["Quantity"]),
-            str(log_entry["Value (INR)"]),
-            log_entry["Reasoning"],
-            log_entry["Status"]
-        ]
-        worksheet.append_row(row)
-    except Exception as e:
-        print(f"Google Sheets Log Save Error: {e}")
+            # Setup Logs Sheet (ExecutionLogs)
+            try:
+                self.logs_sheet = self.spreadsheet.worksheet("ExecutionLogs")
+            except Exception:
+                self.logs_sheet = self.spreadsheet.add_worksheet("ExecutionLogs", rows=2000, cols=7)
+                headers = ["Time (IST)", "Action", "Coin", "Quantity", "Value (INR)", "Reasoning", "Status"]
+                self.logs_sheet.append_row(headers)
+
+            self.last_error = None
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
+
+    def load_trades(self):
+        if not self.trades_sheet and not self.connect():
+            return []
+        try:
+            records = self.trades_sheet.get_all_records()
+            parsed_records = []
+            for row in records:
+                parsed_records.append({
+                    "timestamp": float(row.get("timestamp", 0)),
+                    "coin": str(row.get("coin", "")),
+                    "entry_price": float(row.get("entry_price", 0)),
+                    "exit_price": float(row.get("exit_price", 0)),
+                    "invested": float(row.get("invested", 0)),
+                    "pnl": float(row.get("pnl", 0)),
+                    "pnl_pct": float(row.get("pnl_pct", 0)),
+                    "type": str(row.get("type", "CLOSE"))
+                })
+            return parsed_records
+        except Exception as e:
+            self.last_error = f"Load Trades Error: {e}"
+            return []
+
+    def append_trade(self, trade_record):
+        if not self.trades_sheet and not self.connect():
+            return
+        try:
+            row = [
+                trade_record["timestamp"],
+                trade_record["coin"],
+                trade_record["entry_price"],
+                trade_record["exit_price"],
+                trade_record["invested"],
+                trade_record["pnl"],
+                trade_record["pnl_pct"],
+                trade_record.get("type", "CLOSE")
+            ]
+            self.trades_sheet.append_row(row)
+        except Exception as e:
+            self.last_error = f"Append Trade Error: {e}"
+
+    def append_log(self, log_entry):
+        if not self.logs_sheet and not self.connect():
+            return
+        try:
+            ist_offset = timedelta(hours=5, minutes=30)
+            utc_dt = datetime.fromtimestamp(log_entry["timestamp"], tz=timezone.utc)
+            ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+
+            row = [
+                ist_time,
+                log_entry["Action"],
+                log_entry["Coin"],
+                str(log_entry["Quantity"]),
+                str(log_entry["Value (INR)"]),
+                log_entry["Reasoning"],
+                log_entry["Status"]
+            ]
+            self.logs_sheet.append_row(row)
+        except Exception as e:
+            self.last_error = f"Append Log Error: {e}"
+
+gs_manager = GoogleSheetsManager()
 
 # ==========================================
 # 3. PRO-TRADER PORTFOLIO ENGINE
@@ -155,8 +170,8 @@ class GlobalBotEngine:
         self.active_positions = {}
         self.last_prices = {}
         
-        # Load permanent memory from Google Sheets on start!
-        self.completed_trades = load_trade_history_from_sheets()
+        # Load permanent memory from Google Sheets on boot
+        self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
         self.cooldown_counter = 0
 
@@ -171,13 +186,12 @@ class GlobalBotEngine:
             "Status": status
         }
         
-        # Keep UI fast by only rendering the last 100
         self.trade_log.insert(0, log_entry)
         if len(self.trade_log) > 100:
             self.trade_log.pop()
             
-        # Push permanent log to Google Sheets in the background
-        append_log_to_sheets(log_entry)
+        # Push permanent log to Google Sheets asynchronously
+        gs_manager.append_log(log_entry)
 
     def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
         if not self.is_running:
@@ -248,7 +262,7 @@ class GlobalBotEngine:
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 del self.active_positions[coin]
 
-        # 3. MANAGE HELD POSITIONS
+        # MANAGE POSITIONS
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -361,8 +375,8 @@ class GlobalBotEngine:
                         }
                         self.completed_trades.append(trade_record)
                         
-                        # --- PERMANENTLY SAVE TO GOOGLE SHEETS ---
-                        append_trade_to_sheets(trade_record)
+                        # Permanent record in Google Sheets
+                        gs_manager.append_trade(trade_record)
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                         del self.active_positions[coin]
@@ -500,13 +514,13 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v21():
+def get_global_bot_v22():
     return GlobalBotEngine()
 
-bot = get_global_bot_v21()
+bot = get_global_bot_v22()
 
 # ==========================================
-# 4. STREAMLIT UI CONFIG & CUSTOM STYLING (LIGHT MODE)
+# 4. STREAMLIT UI CONFIG & STYLING
 # ==========================================
 st.set_page_config(
     page_title="AI Portfolio Manager", 
@@ -566,7 +580,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 21.0 (Dual-Cloud Sync) • GPT-120B")
+st.sidebar.caption("Version 22.0 (Live Cloud Diagnostics) • GPT-120B")
 
 
 # ==========================================
@@ -614,13 +628,16 @@ if page == "⚙️ Bot Engine & Settings":
     st.markdown("---")
     
     # -----------------------------
-    # 🌩️ GOOGLE SHEETS CLOUD CHECK
+    # 🌩️ GOOGLE SHEETS DIAGNOSTICS
     # -----------------------------
-    st.subheader("☁️ Database Connection Check")
-    if len(bot.completed_trades) > 0:
-        st.success(f"✅ Connected to Google Sheets! Loaded **{len(bot.completed_trades)}** historical trades safely from the cloud.")
+    st.subheader("☁️ Cloud Storage Connection Status")
+    is_connected = gs_manager.connect()
+    
+    if is_connected:
+        st.success(f"✅ Connected to Google Sheet (`{SHEET_NAME}`)! Found **Sheet1** (Trades) & **ExecutionLogs** tabs.")
     else:
-        st.warning("⚠️ Google Sheets is connected, but the history is currently empty. The first trade will populate it automatically.")
+        st.error(f"❌ Google Sheets Connection Failed: **{gs_manager.last_error}**")
+        st.info("💡 **Fix Steps:** Ensure you shared your Google Sheet with the `client_email` found in your credentials as an **Editor**, and that the Google Sheet document name is exactly `CryptoBotHistory`.")
 
     st.markdown("---")
 
