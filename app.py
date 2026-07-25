@@ -52,7 +52,7 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 def init_sheet_headers(sheet):
-    """Adds column headers if the sheet is completely blank"""
+    """Adds column headers if the trade sheet is completely blank"""
     if not sheet.get_all_values():
         headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
         sheet.append_row(headers)
@@ -67,7 +67,6 @@ def load_trade_history_from_sheets():
         
         parsed_records = []
         for row in records:
-            # Sheets returns data as strings/ints, parse strictly to float
             parsed_records.append({
                 "timestamp": float(row.get("timestamp", 0)),
                 "coin": str(row.get("coin", "")),
@@ -84,7 +83,7 @@ def load_trade_history_from_sheets():
         return []
 
 def append_trade_to_sheets(trade_record):
-    """Pushes a newly closed trade to a new row in Google Sheets"""
+    """Pushes a newly closed trade to Sheet1"""
     try:
         client = get_gspread_client()
         sheet = client.open(SHEET_NAME).sheet1
@@ -101,6 +100,39 @@ def append_trade_to_sheets(trade_record):
         sheet.append_row(row)
     except Exception as e:
         print(f"Google Sheets Save Error: {e}")
+
+def append_log_to_sheets(log_entry):
+    """Pushes AI thoughts and execution logs to a separate tab in Google Sheets"""
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open(SHEET_NAME)
+        
+        # Check if "ExecutionLogs" tab exists. If not, create it.
+        sheet_list = [s.title for s in spreadsheet.worksheets()]
+        if "ExecutionLogs" in sheet_list:
+            worksheet = spreadsheet.worksheet("ExecutionLogs")
+        else:
+            worksheet = spreadsheet.add_worksheet("ExecutionLogs", rows=1000, cols=7)
+            headers = ["Time (IST)", "Action", "Coin", "Quantity", "Value (INR)", "Reasoning", "Status"]
+            worksheet.append_row(headers)
+            
+        # Convert timestamp to human-readable IST for the spreadsheet
+        ist_offset = timedelta(hours=5, minutes=30)
+        utc_dt = datetime.fromtimestamp(log_entry["timestamp"], tz=timezone.utc)
+        ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+        
+        row = [
+            ist_time,
+            log_entry["Action"],
+            log_entry["Coin"],
+            str(log_entry["Quantity"]),
+            str(log_entry["Value (INR)"]),
+            log_entry["Reasoning"],
+            log_entry["Status"]
+        ]
+        worksheet.append_row(row)
+    except Exception as e:
+        print(f"Google Sheets Log Save Error: {e}")
 
 # ==========================================
 # 3. PRO-TRADER PORTFOLIO ENGINE
@@ -138,9 +170,14 @@ class GlobalBotEngine:
             "Reasoning": reason,
             "Status": status
         }
+        
+        # Keep UI fast by only rendering the last 100
         self.trade_log.insert(0, log_entry)
         if len(self.trade_log) > 100:
             self.trade_log.pop()
+            
+        # Push permanent log to Google Sheets in the background
+        append_log_to_sheets(log_entry)
 
     def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
         if not self.is_running:
@@ -463,10 +500,10 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v20():
+def get_global_bot_v21():
     return GlobalBotEngine()
 
-bot = get_global_bot_v20()
+bot = get_global_bot_v21()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & CUSTOM STYLING (LIGHT MODE)
@@ -529,7 +566,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 20.0 (Cloud Sync) • GPT-120B")
+st.sidebar.caption("Version 21.0 (Dual-Cloud Sync) • GPT-120B")
 
 
 # ==========================================
