@@ -8,7 +8,7 @@ import requests
 import math
 import threading
 from groq import Groq
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ==========================================
 # 1. SECURE API KEYS (From Streamlit Secrets)
@@ -53,7 +53,7 @@ class GlobalBotEngine:
 
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
         log_entry = {
-            "Time": datetime.now().strftime("%I:%M:%S %p"),
+            "Time": datetime.now(ist_timezone).strftime("%I:%M:%S %p"),
             "Action": action,
             "Quantity": crypto_amt,
             "Target Budget / Value": inr_budget,
