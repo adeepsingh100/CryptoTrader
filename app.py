@@ -7,12 +7,15 @@ import hashlib
 import requests
 import math
 import threading
-import os
 from groq import Groq
 from datetime import datetime, timezone, timedelta
 
+# Google Sheets Libraries
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
 # ==========================================
-# 1. SECURE API KEYS (From Streamlit Secrets)
+# 1. SECURE API KEYS & AUTHENTICATION
 # ==========================================
 try:
     API_KEY = st.secrets["COINDCX_API_KEY"]
@@ -22,27 +25,6 @@ except Exception:
     API_KEY = "YOUR_COINDCX_API_KEY_HERE"
     API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
     GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
-
-# ==========================================
-# 2. PERSISTENT STORAGE HELPERS
-# ==========================================
-HISTORY_FILE = "trades_history.json"
-
-def load_trade_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_trade_history(completed_trades):
-    try:
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(completed_trades, f, indent=2)
-    except Exception:
-        pass
 
 def coindcx_auth_post(endpoint, body):
     url = f"https://api.coindcx.com{endpoint}"
@@ -58,6 +40,69 @@ def coindcx_auth_post(endpoint, body):
     return requests.post(url, data=json_body, headers=headers).json()
 
 # ==========================================
+# 2. GOOGLE SHEETS PERMANENT STORAGE HELPERS
+# ==========================================
+SHEET_NAME = "CryptoBotHistory"
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+
+def get_gspread_client():
+    """Authenticates using the credentials in Streamlit Secrets"""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPE)
+    return gspread.authorize(creds)
+
+def init_sheet_headers(sheet):
+    """Adds column headers if the sheet is completely blank"""
+    if not sheet.get_all_values():
+        headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
+        sheet.append_row(headers)
+
+def load_trade_history_from_sheets():
+    """Loads all historical trades from Google Sheets into bot memory"""
+    try:
+        client = get_gspread_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        init_sheet_headers(sheet)
+        records = sheet.get_all_records()
+        
+        parsed_records = []
+        for row in records:
+            # Sheets returns data as strings/ints, parse strictly to float
+            parsed_records.append({
+                "timestamp": float(row.get("timestamp", 0)),
+                "coin": str(row.get("coin", "")),
+                "entry_price": float(row.get("entry_price", 0)),
+                "exit_price": float(row.get("exit_price", 0)),
+                "invested": float(row.get("invested", 0)),
+                "pnl": float(row.get("pnl", 0)),
+                "pnl_pct": float(row.get("pnl_pct", 0)),
+                "type": str(row.get("type", "CLOSE"))
+            })
+        return parsed_records
+    except Exception as e:
+        print(f"Google Sheets Load Error: {e}")
+        return []
+
+def append_trade_to_sheets(trade_record):
+    """Pushes a newly closed trade to a new row in Google Sheets"""
+    try:
+        client = get_gspread_client()
+        sheet = client.open(SHEET_NAME).sheet1
+        row = [
+            trade_record["timestamp"],
+            trade_record["coin"],
+            trade_record["entry_price"],
+            trade_record["exit_price"],
+            trade_record["invested"],
+            trade_record["pnl"],
+            trade_record["pnl_pct"],
+            trade_record.get("type", "CLOSE")
+        ]
+        sheet.append_row(row)
+    except Exception as e:
+        print(f"Google Sheets Save Error: {e}")
+
+# ==========================================
 # 3. PRO-TRADER PORTFOLIO ENGINE
 # ==========================================
 class GlobalBotEngine:
@@ -71,13 +116,15 @@ class GlobalBotEngine:
         self.trade_amount = 110.0
         self.tp_pct = 2.0
         self.sl_pct = 3.0
-        self.check_interval = 10  # Default to 10 min for safer trading
-        self.candle_interval = "1h" # Default to 1 hour chart
+        self.check_interval = 10
+        self.candle_interval = "1h"
         
         self.inr_balance = 0.0
         self.active_positions = {}
         self.last_prices = {}
-        self.completed_trades = load_trade_history()
+        
+        # Load permanent memory from Google Sheets on start!
+        self.completed_trades = load_trade_history_from_sheets()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
         self.cooldown_counter = 0
 
@@ -145,6 +192,7 @@ class GlobalBotEngine:
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
+        # RECOVERY
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -158,10 +206,12 @@ class GlobalBotEngine:
                             "invested": value
                         }
 
+        # CLEANUP
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 del self.active_positions[coin]
 
+        # 3. MANAGE HELD POSITIONS
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -176,7 +226,6 @@ class GlobalBotEngine:
             ai_reason = ""
             
             try:
-                # Using the user-selected timeframe
                 url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
                 candles_data = requests.get(url).json()
                 df = pd.DataFrame(candles_data)
@@ -219,7 +268,7 @@ class GlobalBotEngine:
                         model="openai/gpt-oss-120b",
                         messages=[
                             {"role": "system", "content": sell_prompt},
-                            {"role": "user", "content": f"Held coin {market} metrics ({self.candle_interval} Chart):\n\n{df_str}"}
+                            {"role": "user", "content": f"Held coin {market} metrics:\n\n{df_str}"}
                         ],
                         response_format={"type": "json_object"},
                         temperature=0.1
@@ -274,7 +323,9 @@ class GlobalBotEngine:
                             "type": action_type
                         }
                         self.completed_trades.append(trade_record)
-                        save_trade_history(self.completed_trades)
+                        
+                        # --- PERMANENTLY SAVE TO GOOGLE SHEETS ---
+                        append_trade_to_sheets(trade_record)
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
                         del self.active_positions[coin]
@@ -306,7 +357,6 @@ class GlobalBotEngine:
                 
                 candle_pair = f"I-{coin}_INR"
                 try:
-                    # Using the user-selected timeframe
                     url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
                     candles_data = requests.get(url).json()
                     df = pd.DataFrame(candles_data)
@@ -413,10 +463,10 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v19():
+def get_global_bot_v20():
     return GlobalBotEngine()
 
-bot = get_global_bot_v19()
+bot = get_global_bot_v20()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & CUSTOM STYLING (LIGHT MODE)
@@ -430,25 +480,10 @@ st.set_page_config(
 def inject_custom_css():
     st.markdown("""
     <style>
-        /* Base Light Theme Colors */
-        .stApp {
-            background-color: #f8f9fa; /* Light, airy background */
-            color: #202124;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        }
-
-        /* Clean up top padding */
-        .block-container {
-            padding-top: 2rem !important;
-        }
-
-        /* Sidebar Styling */
-        [data-testid="stSidebar"] {
-            background-color: #ffffff;
-            border-right: 1px solid #e0e0e0;
-        }
-
-        /* Hero Metric Cards (Light Mode Pro) */
+        .stApp { background-color: #f8f9fa; color: #202124; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .block-container { padding-top: 2rem !important; }
+        [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
+        
         .metric-card {
             background: #ffffff;
             border: 1px solid #eaebed;
@@ -458,84 +493,29 @@ def inject_custom_css():
             margin-bottom: 12px;
             transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
-        .metric-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08);
-            border-color: #1a73e8;
-        }
-
-        .metric-title {
-            font-size: 0.85rem;
-            color: #5f6368;
-            text-transform: uppercase;
-            letter-spacing: 0.8px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }
-
-        .metric-value {
-            font-size: 1.8rem;
-            font-weight: 700;
-            color: #202124;
-        }
-
-        .metric-sub {
-            font-size: 0.85rem;
-            margin-top: 6px;
-            font-weight: 500;
-            color: #5f6368;
-        }
-
-        /* Text Status Colors */
+        .metric-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08); border-color: #1a73e8; }
+        .metric-title { font-size: 0.85rem; color: #5f6368; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; margin-bottom: 8px; }
+        .metric-value { font-size: 1.8rem; font-weight: 700; color: #202124; }
+        .metric-sub { font-size: 0.85rem; margin-top: 6px; font-weight: 500; color: #5f6368; }
         .text-green { color: #0f9d58 !important; }
         .text-red { color: #d23f31 !important; }
         .text-blue { color: #1a73e8 !important; }
-
-        /* Custom Progress Bar Styling */
-        .stProgress > div > div > div > div {
-            background-color: #1a73e8;
-        }
-
-        /* Form & Setup Containers */
-        .settings-box {
-            background: #ffffff;
-            border: 1px solid #eaebed;
-            border-radius: 12px;
-            padding: 24px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.02);
-            margin-bottom: 24px;
-        }
-
-        /* Tab Polish */
-        .stTabs [data-baseweb="tab-list"] {
-            background-color: transparent;
-            border-bottom: 1px solid #e0e0e0;
-            gap: 16px;
-        }
-
-        .stTabs [data-baseweb="tab"] {
-            height: 48px;
-            font-weight: 600;
-            color: #5f6368;
-        }
-
-        .stTabs [aria-selected="true"] {
-            color: #1a73e8 !important;
-            border-bottom-color: #1a73e8 !important;
-        }
-
-        /* Responsive Mobile Handling */
-        @media (max-width: 768px) {
-            .metric-value { font-size: 1.4rem; }
-            .metric-card { padding: 16px; }
-        }
+        .stProgress > div > div > div > div { background-color: #1a73e8; }
+        
+        .settings-box { background: #ffffff; border: 1px solid #eaebed; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 24px; }
+        
+        .stTabs [data-baseweb="tab-list"] { background-color: transparent; border-bottom: 1px solid #e0e0e0; gap: 16px; }
+        .stTabs [data-baseweb="tab"] { height: 48px; font-weight: 600; color: #5f6368; }
+        .stTabs [aria-selected="true"] { color: #1a73e8 !important; border-bottom-color: #1a73e8 !important; }
+        
+        @media (max-width: 768px) { .metric-value { font-size: 1.4rem; } .metric-card { padding: 16px; } }
     </style>
     """, unsafe_allow_html=True)
 
 inject_custom_css()
 
 # ==========================================
-# 5. SIDEBAR NAVIGATION & SYSTEM HEALTH
+# 5. SIDEBAR NAVIGATION
 # ==========================================
 st.sidebar.markdown("## 🏦 **AI Portfolio**")
 page = st.sidebar.radio("Navigation", ["📊 Live Dashboard", "⚙️ Bot Engine & Settings"])
@@ -544,20 +524,13 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("#### System Health")
 
 if bot.is_running:
-    st.sidebar.markdown("""
-        <div style="background: #e6f4ea; border: 1px solid #ceead6; border-radius: 8px; padding: 12px; color: #137333; font-weight: 600; font-size: 0.9rem; text-align: center;">
-            🟢 AUTOPILOT ACTIVE
-        </div>
-    """, unsafe_allow_html=True)
+    st.sidebar.markdown("""<div style="background: #e6f4ea; border: 1px solid #ceead6; border-radius: 8px; padding: 12px; color: #137333; font-weight: 600; font-size: 0.9rem; text-align: center;">🟢 AUTOPILOT ACTIVE</div>""", unsafe_allow_html=True)
 else:
-    st.sidebar.markdown("""
-        <div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">
-            🔴 AUTOPILOT STOPPED
-        </div>
-    """, unsafe_allow_html=True)
+    st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 19.0 (Pro Multi-Timeframe) • GPT-120B")
+st.sidebar.caption("Version 20.0 (Cloud Sync) • GPT-120B")
+
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -567,15 +540,13 @@ if page == "⚙️ Bot Engine & Settings":
     st.title("⚙️ Engine Settings & Live Logs")
     st.markdown("Configure your quantitative trading parameters and monitor real-time AI decisions.")
     
-    # Clean Form UI
     st.markdown('<div class="settings-box">', unsafe_allow_html=True)
     st.markdown("#### 🎯 Trade Strategy")
-    
     col1, col2 = st.columns(2)
     with col1:
         cand_input = st.text_input("Assets to Monitor (Comma separated)", value="BTC, ETH, SOL, XRP, DOGE")
     with col2:
-        candle_interval = st.selectbox("Candle Timeframe (Chart Size)", ["15m", "30m", "1h", "4h", "1d"], index=2, help="1h or 4h is recommended for max safety and min false signals.")
+        candle_interval = st.selectbox("Candle Timeframe (Chart Size)", ["15m", "30m", "1h", "4h", "1d"], index=2)
     
     st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
     colA, colB = st.columns(2)
@@ -586,10 +557,9 @@ if page == "⚙️ Bot Engine & Settings":
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
         sl_pct = st.number_input("Stop-Loss Limit (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
-    interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval), help="Time between AI scans. Set to 10m if using 1h candles.")
+    interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval))
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Action Buttons
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
@@ -605,11 +575,22 @@ if page == "⚙️ Bot Engine & Settings":
             st.rerun()
 
     st.markdown("---")
+    
+    # -----------------------------
+    # 🌩️ GOOGLE SHEETS CLOUD CHECK
+    # -----------------------------
+    st.subheader("☁️ Database Connection Check")
+    if len(bot.completed_trades) > 0:
+        st.success(f"✅ Connected to Google Sheets! Loaded **{len(bot.completed_trades)}** historical trades safely from the cloud.")
+    else:
+        st.warning("⚠️ Google Sheets is connected, but the history is currently empty. The first trade will populate it automatically.")
+
+    st.markdown("---")
 
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets on **{bot.candle_interval}** timeframe | Risk Cap: ₹{bot.max_budget} | Interval: {bot.check_interval}m")
+            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets on {bot.candle_interval} timeframe | Interval: {bot.check_interval}m")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
