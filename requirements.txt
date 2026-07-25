@@ -1,0 +1,5 @@
+streamlit==1.24.1
+pandas
+numpy>=1.25.0
+scikit-learn
+Pillow
