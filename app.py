@@ -52,18 +52,10 @@ class GlobalBotEngine:
         self.trade_amount_inr = 150.0
         self.check_interval = 5
     
-    def get_ist_time():
-        """Gets exact Indian Standard Time regardless of server OS settings."""
-        utc_now = datetime.now(timezone.utc)
-        ist_now = utc_now + timedelta(hours=5, minutes=30)
-        return ist_now.strftime("%I:%M:%S %p")
-    
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
-        # Force exact Indian Standard Time (Asia/Kolkata)
-        ist_time = datetime.now(ZoneInfo("Asia/Kolkata"))
-        
+        # Store raw UTC timestamp so display formatting is always accurate
         log_entry = {
-            "Time": get_ist_time(),
+            "timestamp": time.time(),
             "Action": action,
             "Quantity": crypto_amt,
             "Target Budget / Value": inr_budget,
