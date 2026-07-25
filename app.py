@@ -40,7 +40,7 @@ def coindcx_auth_post(endpoint, body):
     return requests.post(url, data=json_body, headers=headers).json()
 
 # ==========================================
-# 3. GLOBAL SHARED BOT ENGINE (OPTIMIZED)
+# 3. GLOBAL SHARED BOT ENGINE (UPGRADED MODEL)
 # ==========================================
 class GlobalBotEngine:
     def __init__(self):
@@ -142,7 +142,7 @@ class GlobalBotEngine:
         
         market_data_str = df[['time', 'close', 'EMA_5', 'Price_Change_%']].tail(10).to_string(index=False)
 
-        # 5. Ask Groq AI (Optimized Hedge Fund Prompt)
+        # 5. Ask GPT-OSS 120B via Groq
         client = Groq(api_key=GROQ_API_KEY)
         system_prompt = """You are an elite, hyper-conservative algorithmic crypto hedge fund manager focused on profit compounding. 
         Analyze the provided price action, exponential moving average (EMA_5), and momentum percentage (% change).
@@ -156,7 +156,7 @@ class GlobalBotEngine:
         user_prompt = f"Analyze market metrics for {market_symbol}:\n\n{market_data_str}"
         
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="openai/gpt-oss-120b",  # <--- UPGRADED TO GPT-OSS 120B
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -229,18 +229,18 @@ class GlobalBotEngine:
             self.log_trade("HOLD", "0", "₹0.00", reasoning, "No Action Taken")
 
 
-# Cache instance globally across ALL web sessions
+# Cache instance globally across ALL web sessions (v5 prevents ghost threads)
 @st.cache_resource
-def get_global_bot_v4():
+def get_global_bot_v5():
     return GlobalBotEngine()
 
-bot = get_global_bot_v4()
+bot = get_global_bot_v5()
 
 # ==========================================
 # 4. STREAMLIT UI & LIVE DISPLAY
 # ==========================================
-st.set_page_config(page_title="Global Live AI Bot", layout="wide")
-st.title("🌐 Synchronized Live CoinDCX AI Bot")
+st.set_page_config(page_title="Global Live AI Bot (GPT-120B)", layout="wide")
+st.title("🌐 Synchronized Live CoinDCX AI Bot (GPT-OSS 120B)")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -252,7 +252,7 @@ with col3:
 
 ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
 with ctrl_col1:
-    if st.button("▶️ START BOT", type="primary", use_container_width=True, disabled=bot.is_running):
+    if st.button("▶️ START BOT", type="primary", use_keyword=True, use_container_width=True, disabled=bot.is_running):
         bot.start(coin_input, budget_input, interval_input)
         st.rerun()
 
@@ -271,7 +271,6 @@ st.divider()
 # --- ISOLATED AUTO-REFRESHING FRAGMENT WITH LIVE WALLET METRICS ---
 @st.fragment(run_every="10s")
 def live_status_board():
-    # Fetch live wallet balances directly for real-time UI visibility
     live_inr = bot.inr_balance
     live_coin = bot.coin_balance
     try:
@@ -294,7 +293,7 @@ def live_status_board():
     else:
         st.error("🔴 **GLOBAL STATUS: STOPPED**")
         
-    # 2. Live Wallet Metrics Row (Shows exactly how much INR and Coin you hold)
+    # 2. Live Wallet Metrics Row
     metric_col1, metric_col2 = st.columns(2)
     with metric_col1:
         st.metric("💰 Available INR Balance", f"₹{live_inr:,.2f}")
@@ -306,7 +305,6 @@ def live_status_board():
     if not bot.trade_log:
         st.info("No activity recorded yet.")
     else:
-        # Convert raw UTC timestamps to Indian Standard Time (+5:30) live on render
         formatted_logs = []
         ist_offset = timedelta(hours=5, minutes=30)
         
@@ -321,7 +319,6 @@ def live_status_board():
             
         df_logs = pd.DataFrame(formatted_logs)
         
-        # Ensure Time column is always displayed first
         if "Time (IST)" in df_logs.columns:
             cols = ["Time (IST)"] + [c for c in df_logs.columns if c != "Time (IST)"]
             df_logs = df_logs[cols]
