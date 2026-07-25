@@ -71,7 +71,8 @@ class GlobalBotEngine:
         self.trade_amount = 110.0
         self.tp_pct = 2.0
         self.sl_pct = 3.0
-        self.check_interval = 5
+        self.check_interval = 10  # Default to 10 min for safer trading
+        self.candle_interval = "1h" # Default to 1 hour chart
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -94,7 +95,7 @@ class GlobalBotEngine:
         if len(self.trade_log) > 100:
             self.trade_log.pop()
 
-    def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval):
+    def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
         if not self.is_running:
             self.candidates = [c.strip().upper() for c in candidates.split(",")]
             self.max_budget = max_budget
@@ -102,6 +103,7 @@ class GlobalBotEngine:
             self.tp_pct = tp_pct
             self.sl_pct = sl_pct
             self.check_interval = check_interval
+            self.candle_interval = candle_interval
             
             self.cooldown_counter = 0
             self.is_running = True
@@ -174,7 +176,8 @@ class GlobalBotEngine:
             ai_reason = ""
             
             try:
-                url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=40"
+                # Using the user-selected timeframe
+                url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
                 candles_data = requests.get(url).json()
                 df = pd.DataFrame(candles_data)
                 df['close'] = df['close'].astype(float)
@@ -216,7 +219,7 @@ class GlobalBotEngine:
                         model="openai/gpt-oss-120b",
                         messages=[
                             {"role": "system", "content": sell_prompt},
-                            {"role": "user", "content": f"Held coin {market} metrics:\n\n{df_str}"}
+                            {"role": "user", "content": f"Held coin {market} metrics ({self.candle_interval} Chart):\n\n{df_str}"}
                         ],
                         response_format={"type": "json_object"},
                         temperature=0.1
@@ -303,7 +306,8 @@ class GlobalBotEngine:
                 
                 candle_pair = f"I-{coin}_INR"
                 try:
-                    url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=40"
+                    # Using the user-selected timeframe
+                    url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
                     candles_data = requests.get(url).json()
                     df = pd.DataFrame(candles_data)
                     df['close'] = df['close'].astype(float)
@@ -316,7 +320,7 @@ class GlobalBotEngine:
                     avg_loss = loss.rolling(window=14).mean()
                     rs = avg_gain / avg_loss
                     df['RSI'] = 100 - (100 / (1 + rs))
-                    
+
                     exp1 = df['close'].ewm(span=12, adjust=False).mean()
                     exp2 = df['close'].ewm(span=26, adjust=False).mean()
                     df['MACD'] = exp1 - exp2
@@ -353,7 +357,7 @@ class GlobalBotEngine:
                         model="openai/gpt-oss-120b",
                         messages=[
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Analyze metrics for {best_market}:\n\n{best_df_str}"}
+                            {"role": "user", "content": f"Analyze metrics for {best_market} ({self.candle_interval} Chart):\n\n{best_df_str}"}
                         ],
                         response_format={"type": "json_object"},
                         temperature=0.1
@@ -409,10 +413,10 @@ class GlobalBotEngine:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
 
 @st.cache_resource
-def get_global_bot_v18():
+def get_global_bot_v19():
     return GlobalBotEngine()
 
-bot = get_global_bot_v18()
+bot = get_global_bot_v19()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & CUSTOM STYLING (LIGHT MODE)
@@ -553,7 +557,7 @@ else:
     """, unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 18.0 (Light Mode) • GPT-120B")
+st.sidebar.caption("Version 19.0 (Pro Multi-Timeframe) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -566,7 +570,12 @@ if page == "⚙️ Bot Engine & Settings":
     # Clean Form UI
     st.markdown('<div class="settings-box">', unsafe_allow_html=True)
     st.markdown("#### 🎯 Trade Strategy")
-    cand_input = st.text_input("Assets to Monitor (Comma separated)", value="BTC, ETH, SOL, XRP, DOGE", help="The AI will scan these coins to find the best entry.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        cand_input = st.text_input("Assets to Monitor (Comma separated)", value="BTC, ETH, SOL, XRP, DOGE")
+    with col2:
+        candle_interval = st.selectbox("Candle Timeframe (Chart Size)", ["15m", "30m", "1h", "4h", "1d"], index=2, help="1h or 4h is recommended for max safety and min false signals.")
     
     st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
     colA, colB = st.columns(2)
@@ -577,14 +586,14 @@ if page == "⚙️ Bot Engine & Settings":
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
         sl_pct = st.number_input("Stop-Loss Limit (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
-    interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval))
+    interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval), help="Time between AI scans. Set to 10m if using 1h candles.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Action Buttons
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(cand_input, max_bud, trade_amt, tp_pct, sl_pct, interval_input)
+            bot.start(cand_input, max_bud, trade_amt, tp_pct, sl_pct, interval_input, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -600,7 +609,7 @@ if page == "⚙️ Bot Engine & Settings":
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets | Risk Cap: ₹{bot.max_budget} | Interval: {bot.check_interval}m")
+            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets on **{bot.candle_interval}** timeframe | Risk Cap: ₹{bot.max_budget} | Interval: {bot.check_interval}m")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
@@ -634,7 +643,6 @@ elif page == "📊 Live Dashboard":
 
     @st.fragment(run_every="10s")
     def portfolio_view():
-        # --- 10-SECOND INDEPENDENT LIVE FETCH ---
         live_inr = bot.inr_balance
         live_prices = bot.last_prices.copy()
         try:
@@ -653,7 +661,6 @@ elif page == "📊 Live Dashboard":
         except Exception:
             pass 
         
-        # --- TIME CALCULATIONS (IST) ---
         ist_offset = timedelta(hours=5, minutes=30)
         now_ist = datetime.now(timezone.utc) + ist_offset
         today_date_ist = now_ist.date()
@@ -709,7 +716,6 @@ elif page == "📊 Live Dashboard":
                     else: period_stats["last_month"]["loss"] += abs(pnl)
                     period_stats["last_month"]["count"] += 1
 
-        # --- METRIC COMPUTATIONS ---
         current_invested = sum(p['invested'] for p in bot.active_positions.values())
         unrealized_pnl = 0.0
         for coin, pos in bot.active_positions.items():
@@ -718,7 +724,6 @@ elif page == "📊 Live Dashboard":
 
         budget_pct = min(1.0, current_invested / bot.max_budget) if bot.max_budget > 0 else 0.0
 
-        # --- RESPONSIVE HERO CARDS ---
         m_col1, m_col2, m_col3 = st.columns(3)
         
         with m_col1:
@@ -754,7 +759,6 @@ elif page == "📊 Live Dashboard":
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- MULTI-TIMEFRAME ANALYTICS TABS ---
         st.subheader("📈 Performance History")
         
         tab_today, tab_yesterday, tab_this_m, tab_last_m, tab_all = st.tabs([
@@ -777,7 +781,6 @@ elif page == "📊 Live Dashboard":
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- ACTIVE PORTFOLIO TABLE ---
         st.subheader("💼 Active Holdings")
         if not bot.active_positions:
             st.info("No active positions held. Bot is scanning candidates for precision bounce setups.")
@@ -802,7 +805,6 @@ elif page == "📊 Live Dashboard":
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # --- CLOSED TRADES ARCHIVE ---
         st.subheader("📂 Settled Transactions")
         if not bot.completed_trades:
             st.caption("No completed trades recorded in history file yet.")
