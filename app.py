@@ -40,7 +40,7 @@ def coindcx_auth_post(endpoint, body):
     return requests.post(url, data=json_body, headers=headers).json()
 
 # ==========================================
-# 3. GLOBAL SHARED BOT ENGINE (UPGRADED MODEL)
+# 3. GLOBAL SHARED BOT ENGINE (RSI MEAN REVERSION)
 # ==========================================
 class GlobalBotEngine:
     def __init__(self):
@@ -52,9 +52,9 @@ class GlobalBotEngine:
         self.check_interval = 5
         self.inr_balance = 0.0
         self.coin_balance = 0.0
+        self.cooldown_counter = 0
 
     def log_trade(self, action, crypto_amt, inr_budget, reason, status):
-        # Store raw UTC epoch timestamp so UI renders IST accurately
         log_entry = {
             "timestamp": time.time(),
             "Action": action,
@@ -70,6 +70,7 @@ class GlobalBotEngine:
             self.coin = coin
             self.trade_amount_inr = trade_amount_inr
             self.check_interval = check_interval
+            self.cooldown_counter = 0
             self.is_running = True
             self.thread = threading.Thread(target=self._run_loop, daemon=True)
             self.thread.start()
@@ -78,14 +79,12 @@ class GlobalBotEngine:
         self.is_running = False
 
     def _run_loop(self):
-        """Runs continuously in the background independent of UI sessions."""
         while self.is_running:
             try:
                 self._execute_cycle()
             except Exception as e:
                 self.log_trade("ERROR", "0", "₹0.00", str(e), "Background Crash")
             
-            # Sleep in short increments so stopping is instant when triggered
             sleep_seconds = int(self.check_interval * 60)
             for _ in range(sleep_seconds):
                 if not self.is_running:
@@ -111,6 +110,12 @@ class GlobalBotEngine:
                 elif curr == self.coin:
                     self.coin_balance = bal
 
+        # Cooldown check to prevent whipsawing
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            self.log_trade("HOLD", "0", "₹0.00", f"Cooldown active ({self.cooldown_counter} cycles remaining).", "Protected")
+            return
+
         # 2. Precision Rules
         markets_url = "https://api.coindcx.com/exchange/v1/markets_details"
         markets = requests.get(markets_url).json()
@@ -127,31 +132,37 @@ class GlobalBotEngine:
             
         current_price = float(ticker['last_price'])
 
-        # 4. Fetch Chart Data & Calculate Technical Indicators (15m Timeframe)
-        candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=15"
+        # 4. Fetch Chart Data & Calculate RSI (14 Period)
+        candles_url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval=15m&limit=30"
         candles_data = requests.get(candles_url).json()
         
         df = pd.DataFrame(candles_data)
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         df = df.sort_values(by='time', ascending=True)
         
-        # Add Technical Indicators (EMA & Price Momentum)
         df['close'] = df['close'].astype(float)
-        df['EMA_5'] = df['close'].ewm(span=5, adjust=False).mean()
-        df['Price_Change_%'] = df['close'].pct_change() * 100
         
-        market_data_str = df[['time', 'close', 'EMA_5', 'Price_Change_%']].tail(10).to_string(index=False)
+        # Mathematical calculation for RSI
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -1 * delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        market_data_str = df[['time', 'close', 'RSI']].tail(10).to_string(index=False)
 
-        # 5. Ask GPT-OSS 120B via Groq
+        # 5. Ask GPT-OSS 120B with Mean Reversion Strategy (Buy Low, Sell High)
         client = Groq(api_key=GROQ_API_KEY)
-        system_prompt = """You are an elite, hyper-conservative algorithmic crypto hedge fund manager focused on profit compounding. 
-        Analyze the provided price action, exponential moving average (EMA_5), and momentum percentage (% change).
-        - Output 'BUY' only if momentum and EMA indicate an upward trend.
-        - Output 'SELL' if momentum is breaking down or profits should be secured.
-        - Default to 'HOLD' if the trend is sideways or unclear.
+        system_prompt = """You are an expert crypto mean-reversion trading bot. Your strict goal is to BUY LOW and SELL HIGH.
+        Analyze the provided close price and RSI (Relative Strength Index):
+        - RSI below 35 indicates the asset is OVERSOLD (market price is low / a dip). Output 'BUY' to accumulate low.
+        - RSI above 65 indicates the asset is OVERBOUGHT (market price is high / a peak). Output 'SELL' to lock in profits.
+        - RSI between 35 and 65 means neutral. Output 'HOLD'.
         You MUST respond ONLY with a valid JSON object containing:
         "action": strictly "BUY", "SELL", or "HOLD",
-        "reasoning": a brief 1-sentence analytical explanation."""
+        "reasoning": a brief 1-sentence analytical explanation mentioning the RSI value."""
         
         user_prompt = f"Analyze market metrics for {market_symbol}:\n\n{market_data_str}"
         
@@ -197,6 +208,7 @@ class GlobalBotEngine:
                 order_response = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                 if "orders" in order_response or "id" in order_response:
                     self.log_trade("BUY", formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
+                    self.cooldown_counter = 4
                 else:
                     err = order_response.get("message", "API Error")
                     self.log_trade("BUY FAILED", formatted_qty, f"₹{actual_cost:.2f}", reasoning, f"Rejected: {err}")
@@ -222,6 +234,7 @@ class GlobalBotEngine:
                 order_response = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                 if "orders" in order_response or "id" in order_response:
                     self.log_trade("SELL", formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
+                    self.cooldown_counter = 4
                 else:
                     err = order_response.get("message", "API Error")
                     self.log_trade("SELL FAILED", formatted_qty, f"₹{actual_value:.2f}", reasoning, f"Rejected: {err}")
@@ -231,16 +244,16 @@ class GlobalBotEngine:
 
 # Cache instance globally across ALL web sessions
 @st.cache_resource
-def get_global_bot_v6():
+def get_global_bot_v8():
     return GlobalBotEngine()
 
-bot = get_global_bot_v6()
+bot = get_global_bot_v8()
 
 # ==========================================
 # 4. STREAMLIT UI & LIVE DISPLAY
 # ==========================================
-st.set_page_config(page_title="Global Live AI Bot (GPT-120B)", layout="wide")
-st.title("🌐 Synchronized Live CoinDCX AI Bot (GPT-OSS 120B)")
+st.set_page_config(page_title="Global Live AI Bot (RSI Mean Reversion)", layout="wide")
+st.title("🌐 Synchronized Live CoinDCX AI Bot (RSI Mean Reversion)")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -289,7 +302,8 @@ def live_status_board():
 
     # 1. Live Bot Status Banner
     if bot.is_running:
-        st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**, Check Interval: **{bot.check_interval} min**)")
+        cooldown_status = f" | ⏳ Cooldown: {bot.cooldown_counter} cycles left" if bot.cooldown_counter > 0 else ""
+        st.success(f"🟢 **GLOBAL STATUS: RUNNING LIVE** (Target: **{bot.coin}**, Budget: **₹{bot.trade_amount_inr}**{cooldown_status})")
     else:
         st.error("🔴 **GLOBAL STATUS: STOPPED**")
         
