@@ -27,9 +27,8 @@ except Exception:
     API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
     GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
-# Bypasses Cloudflare block on the public endpoints
 REQ_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json'
 }
 
@@ -177,7 +176,6 @@ class GlobalBotEngine:
     _active_instances = []
 
     def __init__(self):
-        # Terminate older duplicate background threads
         for old_bot in GlobalBotEngine._active_instances:
             old_bot.is_running = False
         GlobalBotEngine._active_instances.clear()
@@ -189,7 +187,7 @@ class GlobalBotEngine:
         
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.max_budget = 500.0
-        self.trade_amount = 110.0
+        self.trade_amount = 125.0
         self.tp_pct = 2.0
         self.sl_pct = 3.0
         self.check_interval = 10
@@ -238,6 +236,23 @@ class GlobalBotEngine:
     def stop(self):
         self.is_running = False
 
+    def fetch_candle_data_safely(self, coin):
+        """Smart router that tries different prefixes and avoids Cloudflare blocks."""
+        prefixes = ["I", "B", "C"]
+        for prefix in prefixes:
+            pair = f"{prefix}-{coin}_INR"
+            url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit=40"
+            try:
+                res = requests.get(url, headers=REQ_HEADERS, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) >= 20:
+                        return data, pair
+            except Exception:
+                pass
+            time.sleep(1.0) # 1-Second anti-DDoS buffer between prefix checks
+        return None, None
+
     def _run_loop(self):
         while self.is_running:
             try:
@@ -265,19 +280,19 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Market Tickers
+        # 2. Extract specific precision & minimum quantity requirements
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", headers=REQ_HEADERS, timeout=10)
             markets = markets_res.json()
             market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
+            market_min_qty = {m['symbol']: float(m.get('min_quantity', 0.0001)) for m in markets if 'symbol' in m}
             
             tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
-        except Exception as e:
-            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Failed to fetch market data. Cloudflare/Network issue.", "API Pause")
+        except Exception:
+            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Failed to fetch market details. Retrying next cycle.", "API Pause")
             return
 
-        # 3. Wallet Sync Recovery & Cleanup
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -290,15 +305,15 @@ class GlobalBotEngine:
                             "entry_price": curr_price,
                             "invested": value
                         }
-                        self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected coin in wallet from external trade.", "Wallet Sync")
+                        self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected external buy trade.", "Wallet Sync")
 
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
-                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Coin missing from wallet. Assuming external/manual sell.", "Wallet Sync")
+                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Coin missing from wallet. Assuming external sell.", "Wallet Sync")
                 del self.active_positions[coin]
 
         # =========================================================================
-        # 4. THE GUARDIAN AI: Manages ACTIVE positions to SELL at peak profit
+        # 4. THE GUARDIAN AI (Manages Active Positions)
         # =========================================================================
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
@@ -309,19 +324,15 @@ class GlobalBotEngine:
             pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
             curr_val = pos['qty'] * curr_price
             
-            # FIXED: Always use 'I-' for INR native pairs to prevent 404 Not Found errors
-            candle_pair = f"I-{coin}_INR"
-            
             ai_sell_signal = False
             ai_reason = ""
             
-            try:
-                url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                res = requests.get(url, headers=REQ_HEADERS, timeout=12)
-                res.raise_for_status()
-                candles_data = res.json()
-                
-                if isinstance(candles_data, list) and len(candles_data) >= 20:
+            # Fetch candles using robust router
+            candles_data, candle_pair = self.fetch_candle_data_safely(coin)
+            time.sleep(1.5) # Anti-DDoS delay between checks
+            
+            if candles_data:
+                try:
                     df = pd.DataFrame(candles_data)
                     df['close'] = df['close'].astype(float)
                     df['high'] = df['high'].astype(float)
@@ -375,19 +386,16 @@ class GlobalBotEngine:
                             ai_reason = decision_data.get("reasoning", "AI detected peak exhaustion.")
                         else:
                             self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             is_tp = pnl_pct >= self.tp_pct
             is_sl = pnl_pct <= -self.sl_pct
             
             if is_tp or is_sl or ai_sell_signal:
-                if is_tp:
-                    action_type, reasoning = "TAKE PROFIT", f"Hard Take-Profit hit (+{pnl_pct:.2f}%)."
-                elif is_sl:
-                    action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss hit ({pnl_pct:.2f}%)."
-                else:
-                    action_type, reasoning = "PRO AI SELL", ai_reason
+                if is_tp: action_type, reasoning = "TAKE PROFIT", f"Hard Take-Profit hit (+{pnl_pct:.2f}%)."
+                elif is_sl: action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss hit ({pnl_pct:.2f}%)."
+                else: action_type, reasoning = "PRO AI SELL", ai_reason
                 
                 precision = market_precision.get(market, 5)
                 multiplier = 10 ** precision
@@ -453,70 +461,57 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                # FIXED: Always use 'I-' for INR native pairs to prevent 404 Not Found errors
-                candle_pair = f"I-{coin}_INR"
+                candles_data, candle_pair = self.fetch_candle_data_safely(coin)
+                time.sleep(1.5) # Anti-DDoS delay
                 
-                try:
-                    url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                    res = requests.get(url, headers=REQ_HEADERS, timeout=12)
-                    res.raise_for_status()
-                    candles_data = res.json()
-                    
-                    if not isinstance(candles_data, list) or len(candles_data) < 20:
+                if candles_data:
+                    try:
+                        df = pd.DataFrame(candles_data)
+                        df['open'] = df['open'].astype(float)
+                        df['high'] = df['high'].astype(float)
+                        df['low'] = df['low'].astype(float)
+                        df['close'] = df['close'].astype(float)
+                        df = df.sort_values(by='time', ascending=True)
+                        
+                        delta = df['close'].diff()
+                        gain = delta.clip(lower=0)
+                        loss = -1 * delta.clip(upper=0)
+                        avg_gain = gain.rolling(window=14).mean()
+                        avg_loss = loss.rolling(window=14).mean()
+                        rs = avg_gain / avg_loss
+                        df['RSI'] = 100 - (100 / (1 + rs))
+
+                        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+                        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+                        df['MACD'] = exp1 - exp2
+                        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+                        df['MACD_Hist'] = df['MACD'] - df['Signal']
+
+                        df['SMA_20'] = df['close'].rolling(window=20).mean()
+                        df['STD_20'] = df['close'].rolling(window=20).std()
+                        df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
+                        
+                        latest_rsi = df['RSI'].iloc[-1]
+                        latest_close = df['close'].iloc[-1]
+                        lower_bb = df['Lower_BB'].iloc[-1]
+                        
+                        scan_success_count += 1
+                        
+                        bb_distance_pct = ((latest_close - lower_bb) / lower_bb) * 100
+                        setup_score = (100.0 - latest_rsi) - (bb_distance_pct * 2)
+
+                        if setup_score > best_setup_score:
+                            best_setup_score = setup_score
+                            best_candidate_coin = coin
+                            best_candidate_market = market
+                            best_candidate_price = curr_price
+                            df['time'] = pd.to_datetime(df['time'], unit='ms')
+                            best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
+                    except Exception:
                         continue
 
-                    df = pd.DataFrame(candles_data)
-                    if not {'close', 'high', 'low', 'open', 'time'}.issubset(df.columns):
-                        continue
-
-                    df['open'] = df['open'].astype(float)
-                    df['high'] = df['high'].astype(float)
-                    df['low'] = df['low'].astype(float)
-                    df['close'] = df['close'].astype(float)
-                    df = df.sort_values(by='time', ascending=True)
-                    
-                    # Technical Indicators
-                    delta = df['close'].diff()
-                    gain = delta.clip(lower=0)
-                    loss = -1 * delta.clip(upper=0)
-                    avg_gain = gain.rolling(window=14).mean()
-                    avg_loss = loss.rolling(window=14).mean()
-                    rs = avg_gain / avg_loss
-                    df['RSI'] = 100 - (100 / (1 + rs))
-
-                    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-                    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-                    df['MACD'] = exp1 - exp2
-                    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-                    df['MACD_Hist'] = df['MACD'] - df['Signal']
-
-                    df['SMA_20'] = df['close'].rolling(window=20).mean()
-                    df['STD_20'] = df['close'].rolling(window=20).std()
-                    df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
-                    
-                    latest_rsi = df['RSI'].iloc[-1]
-                    latest_close = df['close'].iloc[-1]
-                    lower_bb = df['Lower_BB'].iloc[-1]
-                    
-                    scan_success_count += 1
-                    
-                    # Score setups based on deep dips + momentum
-                    bb_distance_pct = ((latest_close - lower_bb) / lower_bb) * 100
-                    setup_score = (100.0 - latest_rsi) - (bb_distance_pct * 2)
-
-                    if setup_score > best_setup_score:
-                        best_setup_score = setup_score
-                        best_candidate_coin = coin
-                        best_candidate_market = market
-                        best_candidate_price = curr_price
-                        df['time'] = pd.to_datetime(df['time'], unit='ms')
-                        best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
-                except Exception:
-                    continue
-
-            # API Timeout Failure Check
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Retrying next cycle.", "API Pause")
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Anti-DDoS engaged. Retrying next cycle.", "API Pause")
                 return
 
             if best_candidate_coin and best_candidate_df_str:
@@ -551,10 +546,12 @@ class GlobalBotEngine:
                         multiplier = 10 ** precision
                         raw_crypto = self.trade_amount / best_candidate_price
                         
-                        if (raw_crypto * best_candidate_price) >= 101.0:
-                            buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
-                        else:
-                            buy_crypto_amount = math.ceil(raw_crypto * multiplier) / multiplier
+                        buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
+                        
+                        # ✨ DYNAMIC SAFEGUARD: Uses CoinDCX's exact minimum quantity rule for THIS specific coin
+                        min_required_qty = market_min_qty.get(best_candidate_market, 0.0001)
+                        if buy_crypto_amount < min_required_qty:
+                            buy_crypto_amount = min_required_qty
                             
                         actual_cost = buy_crypto_amount * best_candidate_price
                         
@@ -655,7 +652,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 28.0 (Stable Router) • GPT-120B")
+st.sidebar.caption("Version 30.0 (Anti-DDoS Shield) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -679,7 +676,7 @@ if page == "⚙️ Bot Engine & Settings":
         max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
         tp_pct = st.number_input("Take-Profit Target (%)", min_value=0.5, value=float(bot.tp_pct), step=0.5)
     with colB:
-        trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=105.0, value=float(bot.trade_amount), step=10.0)
+        trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
         sl_pct = st.number_input("Stop-Loss Limit (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
     interval_input = st.number_input("Scan Market Frequency (Minutes)", min_value=1, value=int(bot.check_interval))
