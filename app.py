@@ -176,6 +176,7 @@ class GlobalBotEngine:
     _active_instances = []
 
     def __init__(self):
+        # Kills Zombie Bots
         for old_bot in GlobalBotEngine._active_instances:
             old_bot.is_running = False
         GlobalBotEngine._active_instances.clear()
@@ -185,9 +186,8 @@ class GlobalBotEngine:
         self.trade_log = []
         self.thread = None
         
-        # New Autonomous Settings
         self.auto_scan_count = 20
-        self.candidates = [] # Will be populated automatically
+        self.candidates = [] # Populated automatically
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
@@ -292,7 +292,6 @@ class GlobalBotEngine:
             tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
             
-            # --- ✨ FULLY AUTONOMOUS COIN DISCOVERY ---
             inr_pairs = [t for t in tickers if t.get('market', '').endswith('INR')]
             
             def get_inr_vol(t):
@@ -301,7 +300,6 @@ class GlobalBotEngine:
                 except:
                     return 0.0
                     
-            # Sort the entire exchange by highest 24h trading volume
             inr_pairs_sorted = sorted(inr_pairs, key=get_inr_vol, reverse=True)
             
             discovered_coins = []
@@ -309,15 +307,13 @@ class GlobalBotEngine:
             
             for pair in inr_pairs_sorted:
                 market_name = pair['market']
-                coin_symbol = market_name[:-3] # Remove "INR"
+                coin_symbol = market_name[:-3]
                 
-                # Add it to the scanner list if it's not a stablecoin
                 if coin_symbol not in stablecoins:
                     discovered_coins.append(coin_symbol)
                     if len(discovered_coins) >= self.auto_scan_count:
                         break
                         
-            # The bot has automatically decided what coins to track!
             self.candidates = discovered_coins
 
         except Exception:
@@ -359,7 +355,6 @@ class GlobalBotEngine:
             ai_sell_signal = False
             ai_reason = ""
             
-            # Use dynamic ecode for accurate data route
             ecode = self.ecode_map.get(market, 'I')
             candle_pair = f"{ecode}-{coin}_INR"
             
@@ -622,11 +617,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
+# Cache Buster Name Change to kill the V30 ghost thread permanently
 @st.cache_resource
-def get_bot_engine():
+def get_bot_engine_v32():
     return GlobalBotEngine()
 
-bot = get_bot_engine()
+bot = get_bot_engine_v32()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -689,7 +685,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 31.0 (Autonomous Market Discovery) • GPT-120B")
+st.sidebar.caption("Version 32.0 (Stable Autopilot) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
