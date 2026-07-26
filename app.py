@@ -185,7 +185,10 @@ class GlobalBotEngine:
         self.trade_log = []
         self.thread = None
         
-        self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
+        # New Autonomous Settings
+        self.auto_scan_count = 20
+        self.candidates = [] # Will be populated automatically
+        
         self.max_budget = 500.0
         self.trade_amount = 125.0
         self.tp_pct = 2.0
@@ -196,6 +199,9 @@ class GlobalBotEngine:
         self.inr_balance = 0.0
         self.active_positions = {}
         self.last_prices = {}
+        self.market_precision = {}
+        self.market_min_qty = {}
+        self.ecode_map = {}
         
         self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
@@ -218,9 +224,9 @@ class GlobalBotEngine:
             
         gs_manager.append_log(log_entry)
 
-    def start(self, candidates, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
+    def start(self, auto_scan_count, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
         if not self.is_running:
-            self.candidates = [c.strip().upper() for c in candidates.split(",")]
+            self.auto_scan_count = auto_scan_count
             self.max_budget = max_budget
             self.trade_amount = trade_amount
             self.tp_pct = tp_pct
@@ -236,22 +242,17 @@ class GlobalBotEngine:
     def stop(self):
         self.is_running = False
 
-    def fetch_candle_data_safely(self, coin):
-        """Smart router that tries different prefixes and avoids Cloudflare blocks."""
-        prefixes = ["I", "B", "C"]
-        for prefix in prefixes:
-            pair = f"{prefix}-{coin}_INR"
-            url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit=40"
-            try:
-                res = requests.get(url, headers=REQ_HEADERS, timeout=8)
-                if res.status_code == 200:
-                    data = res.json()
-                    if isinstance(data, list) and len(data) >= 20:
-                        return data, pair
-            except Exception:
-                pass
-            time.sleep(1.0) # 1-Second anti-DDoS buffer between prefix checks
-        return None, None
+    def fetch_candle_data(self, candle_pair):
+        url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
+        try:
+            res = requests.get(url, headers=REQ_HEADERS, timeout=12)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) >= 20:
+                    return data
+        except Exception:
+            pass
+        return None
 
     def _run_loop(self):
         while self.is_running:
@@ -267,7 +268,7 @@ class GlobalBotEngine:
                 time.sleep(1)
 
     def _execute_cycle(self):
-        # 1. Fetch Balances
+        # 1. Fetch User Balances
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
@@ -280,19 +281,50 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Extract specific precision & minimum quantity requirements
+        # 2. Market Tickers & AUTO-DISCOVERY OF HIGH VOLUME COINS
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", headers=REQ_HEADERS, timeout=10)
             markets = markets_res.json()
-            market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
-            market_min_qty = {m['symbol']: float(m.get('min_quantity', 0.0001)) for m in markets if 'symbol' in m}
+            self.market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
+            self.market_min_qty = {m['symbol']: float(m.get('min_quantity', 0.0001)) for m in markets if 'symbol' in m}
+            self.ecode_map = {m['symbol']: m.get('ecode', 'I') for m in markets if 'symbol' in m}
             
             tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
+            
+            # --- ✨ FULLY AUTONOMOUS COIN DISCOVERY ---
+            inr_pairs = [t for t in tickers if t.get('market', '').endswith('INR')]
+            
+            def get_inr_vol(t):
+                try:
+                    return float(t.get('volume', 0)) * float(t.get('last_price', 0))
+                except:
+                    return 0.0
+                    
+            # Sort the entire exchange by highest 24h trading volume
+            inr_pairs_sorted = sorted(inr_pairs, key=get_inr_vol, reverse=True)
+            
+            discovered_coins = []
+            stablecoins = {'USDT', 'USDC', 'FDUSD', 'DAI', 'BUSD', 'TUSD', 'USTC'}
+            
+            for pair in inr_pairs_sorted:
+                market_name = pair['market']
+                coin_symbol = market_name[:-3] # Remove "INR"
+                
+                # Add it to the scanner list if it's not a stablecoin
+                if coin_symbol not in stablecoins:
+                    discovered_coins.append(coin_symbol)
+                    if len(discovered_coins) >= self.auto_scan_count:
+                        break
+                        
+            # The bot has automatically decided what coins to track!
+            self.candidates = discovered_coins
+
         except Exception:
-            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Failed to fetch market details. Retrying next cycle.", "API Pause")
+            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Failed to sync top volume markets. Retrying next cycle.", "API Pause")
             return
 
+        # 3. Wallet Sync Recovery & Cleanup
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -313,7 +345,7 @@ class GlobalBotEngine:
                 del self.active_positions[coin]
 
         # =========================================================================
-        # 4. THE GUARDIAN AI (Manages Active Positions)
+        # 4. THE GUARDIAN AI: Manages ACTIVE positions to SELL at peak profit
         # =========================================================================
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
@@ -327,9 +359,12 @@ class GlobalBotEngine:
             ai_sell_signal = False
             ai_reason = ""
             
-            # Fetch candles using robust router
-            candles_data, candle_pair = self.fetch_candle_data_safely(coin)
-            time.sleep(1.5) # Anti-DDoS delay between checks
+            # Use dynamic ecode for accurate data route
+            ecode = self.ecode_map.get(market, 'I')
+            candle_pair = f"{ecode}-{coin}_INR"
+            
+            candles_data = self.fetch_candle_data(candle_pair)
+            time.sleep(1.5) # Anti-DDoS delay
             
             if candles_data:
                 try:
@@ -397,7 +432,7 @@ class GlobalBotEngine:
                 elif is_sl: action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss hit ({pnl_pct:.2f}%)."
                 else: action_type, reasoning = "PRO AI SELL", ai_reason
                 
-                precision = market_precision.get(market, 5)
+                precision = self.market_precision.get(market, 5)
                 multiplier = 10 ** precision
                 sell_qty = math.floor(actual_balances.get(coin, 0) * multiplier) / multiplier
                 actual_value = sell_qty * curr_price
@@ -442,7 +477,7 @@ class GlobalBotEngine:
             return
 
         # =========================================================================
-        # 5. THE SCANNER AI: Hunts for new BUY opportunities
+        # 5. THE SCANNER AI: Hunts the top volume coins for new BUY opportunities
         # =========================================================================
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
@@ -461,7 +496,10 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                candles_data, candle_pair = self.fetch_candle_data_safely(coin)
+                ecode = self.ecode_map.get(market, 'I')
+                candle_pair = f"{ecode}-{coin}_INR"
+                
+                candles_data = self.fetch_candle_data(candle_pair)
                 time.sleep(1.5) # Anti-DDoS delay
                 
                 if candles_data:
@@ -511,7 +549,7 @@ class GlobalBotEngine:
                         continue
 
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Anti-DDoS engaged. Retrying next cycle.", "API Pause")
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Candle endpoints unresponsive. Retrying next cycle.", "API Pause")
                 return
 
             if best_candidate_coin and best_candidate_df_str:
@@ -542,14 +580,13 @@ class GlobalBotEngine:
                     reasoning = decision_data.get("reasoning", "AI evaluated market structure.")
 
                     if action == "BUY":
-                        precision = market_precision.get(best_candidate_market, 5)
+                        precision = self.market_precision.get(best_candidate_market, 5)
                         multiplier = 10 ** precision
                         raw_crypto = self.trade_amount / best_candidate_price
                         
                         buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
                         
-                        # ✨ DYNAMIC SAFEGUARD: Uses CoinDCX's exact minimum quantity rule for THIS specific coin
-                        min_required_qty = market_min_qty.get(best_candidate_market, 0.0001)
+                        min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
                         if buy_crypto_amount < min_required_qty:
                             buy_crypto_amount = min_required_qty
                             
@@ -652,7 +689,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 30.0 (Anti-DDoS Shield) • GPT-120B")
+st.sidebar.caption("Version 31.0 (Autonomous Market Discovery) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -666,7 +703,7 @@ if page == "⚙️ Bot Engine & Settings":
     st.markdown("#### 🎯 Trade Strategy")
     col1, col2 = st.columns(2)
     with col1:
-        cand_input = st.text_input("Assets to Monitor (Comma separated)", value="BTC, ETH, SOL, XRP, DOGE")
+        auto_scan_count = st.slider("Auto-Scan Top Volume Assets (INR)", min_value=5, max_value=50, value=20, help="The bot calculates real-time exchange volume and automatically tracks the most active coins.")
     with col2:
         candle_interval = st.selectbox("Candle Timeframe (Chart Size)", ["15m", "30m", "1h", "4h", "1d"], index=2)
     
@@ -685,7 +722,7 @@ if page == "⚙️ Bot Engine & Settings":
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(cand_input, max_bud, trade_amt, tp_pct, sl_pct, interval_input, candle_interval)
+            bot.start(auto_scan_count, max_bud, trade_amt, tp_pct, sl_pct, interval_input, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -711,7 +748,7 @@ if page == "⚙️ Bot Engine & Settings":
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            st.info(f"⚡ **System Active:** Scanning {len(bot.candidates)} assets on {bot.candle_interval} timeframe | Interval: {bot.check_interval}m")
+            st.info(f"⚡ **System Active:** Auto-scanning Top {len(bot.candidates)} High-Volume assets on {bot.candle_interval} timeframe | Interval: {bot.check_interval}m")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
