@@ -27,6 +27,12 @@ except Exception:
     API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
     GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
+# Bypasses Cloudflare block on the public endpoints
+REQ_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+}
+
 def coindcx_auth_post(endpoint, body):
     url = f"https://api.coindcx.com{endpoint}"
     secret_bytes = bytes(API_SECRET, 'utf-8')
@@ -36,7 +42,8 @@ def coindcx_auth_post(endpoint, body):
     headers = {
         'Content-Type': 'application/json',
         'X-AUTH-APIKEY': API_KEY,
-        'X-AUTH-SIGNATURE': signature
+        'X-AUTH-SIGNATURE': signature,
+        'User-Agent': REQ_HEADERS['User-Agent']
     }
     return requests.post(url, data=json_body, headers=headers).json()
 
@@ -84,7 +91,6 @@ class GoogleSheetsManager:
             return False
 
     def load_trades(self):
-        """Loads historical trades and handles both raw float timestamps and new IST strings."""
         if not self.trades_sheet and not self.connect():
             return []
         try:
@@ -93,18 +99,16 @@ class GoogleSheetsManager:
             for row in records:
                 raw_ts = row.get("timestamp", row.get("Date & Time (IST)", 0))
                 
-                # Check if it's a readable date string or an old raw timestamp
                 try:
                     ts = float(raw_ts)
                 except ValueError:
-                    # Parse the IST string back into a computer timestamp
                     try:
                         dt_obj = datetime.strptime(str(raw_ts), "%Y-%m-%d %I:%M:%S %p")
                         ist_offset = timedelta(hours=5, minutes=30)
                         utc_dt = dt_obj - ist_offset
                         ts = utc_dt.replace(tzinfo=timezone.utc).timestamp()
                     except Exception:
-                        ts = time.time() # Failsafe
+                        ts = time.time()
                         
                 parsed_records.append({
                     "timestamp": ts,
@@ -125,7 +129,6 @@ class GoogleSheetsManager:
         if not self.trades_sheet and not self.connect():
             return
         try:
-            # Convert timestamp to human-readable IST for Sheet1
             ist_offset = timedelta(hours=5, minutes=30)
             utc_dt = datetime.fromtimestamp(trade_record["timestamp"], tz=timezone.utc)
             ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
@@ -262,12 +265,19 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Market Tickers
-        markets = requests.get("https://api.coindcx.com/exchange/v1/markets_details").json()
-        market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
-        
-        tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
-        self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
+        # 2. Market Tickers & Exchange Route Mapping
+        try:
+            markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", headers=REQ_HEADERS, timeout=10)
+            markets = markets_res.json()
+            market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
+            # Crucial: Maps whether the coin uses Binance (B-), Indian (I-), or other liquidity routes
+            ecode_map = {m['symbol']: m.get('ecode', 'I') for m in markets if 'symbol' in m}
+            
+            tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
+            self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
+        except Exception as e:
+            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Failed to fetch market data. Cloudflare/Network issue.", "API Pause")
+            return
 
         # 3. Wallet Sync Recovery & Cleanup
         for coin in self.candidates:
@@ -301,14 +311,19 @@ class GlobalBotEngine:
             pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
             curr_val = pos['qty'] * curr_price
             
-            candle_pair = f"I-{coin}_INR"
+            # Use dynamic ecode instead of hardcoded 'I-'
+            ecode = ecode_map.get(market, 'I')
+            candle_pair = f"{ecode}-{coin}_INR"
+            
             ai_sell_signal = False
             ai_reason = ""
             
             try:
                 url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                res = requests.get(url, timeout=8)
+                res = requests.get(url, headers=REQ_HEADERS, timeout=12)
+                res.raise_for_status()
                 candles_data = res.json()
+                
                 if isinstance(candles_data, list) and len(candles_data) >= 20:
                     df = pd.DataFrame(candles_data)
                     df['close'] = df['close'].astype(float)
@@ -441,10 +456,14 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                candle_pair = f"I-{coin}_INR"
+                # Use dynamic ecode
+                ecode = ecode_map.get(market, 'I')
+                candle_pair = f"{ecode}-{coin}_INR"
+                
                 try:
                     url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                    res = requests.get(url, timeout=8)
+                    res = requests.get(url, headers=REQ_HEADERS, timeout=12)
+                    res.raise_for_status()
                     candles_data = res.json()
                     
                     if not isinstance(candles_data, list) or len(candles_data) < 20:
@@ -499,11 +518,12 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # API Timeout Failure Check
+            # Handles CoinDCX API rate-limiting/timeouts gracefully
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Retrying next cycle.", "API Pause")
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle API blocked or unresponsive. Retrying next cycle.", "API Pause")
                 return
 
+            # Pure AI Autonomous Decision Making
             if best_candidate_coin and best_candidate_df_str:
                 client = Groq(api_key=GROQ_API_KEY)
                 system_prompt = """You are a ruthless quantitative crypto trader analyzing live candlestick data (OHLC), RSI, MACD Histogram, and Lower Bollinger Bands.
@@ -640,7 +660,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 26.0 (Pro AI Guard) • GPT-120B")
+st.sidebar.caption("Version 27.0 (Cloudflare Bypass) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -743,7 +763,7 @@ elif page == "📊 Live Dashboard":
                     if b.get('currency') == 'INR':
                         live_inr = float(b.get('balance', 0))
                         
-            tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
+            tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
             if isinstance(tickers, list):
                 for t in tickers:
                     if 'market' in t:
