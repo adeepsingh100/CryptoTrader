@@ -265,13 +265,11 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Market Tickers & Exchange Route Mapping
+        # 2. Market Tickers
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", headers=REQ_HEADERS, timeout=10)
             markets = markets_res.json()
             market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
-            # Crucial: Maps whether the coin uses Binance (B-), Indian (I-), or other liquidity routes
-            ecode_map = {m['symbol']: m.get('ecode', 'I') for m in markets if 'symbol' in m}
             
             tickers = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10).json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
@@ -311,9 +309,8 @@ class GlobalBotEngine:
             pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
             curr_val = pos['qty'] * curr_price
             
-            # Use dynamic ecode instead of hardcoded 'I-'
-            ecode = ecode_map.get(market, 'I')
-            candle_pair = f"{ecode}-{coin}_INR"
+            # FIXED: Always use 'I-' for INR native pairs to prevent 404 Not Found errors
+            candle_pair = f"I-{coin}_INR"
             
             ai_sell_signal = False
             ai_reason = ""
@@ -456,9 +453,8 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                # Use dynamic ecode
-                ecode = ecode_map.get(market, 'I')
-                candle_pair = f"{ecode}-{coin}_INR"
+                # FIXED: Always use 'I-' for INR native pairs to prevent 404 Not Found errors
+                candle_pair = f"I-{coin}_INR"
                 
                 try:
                     url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
@@ -518,12 +514,11 @@ class GlobalBotEngine:
                 except Exception:
                     continue
 
-            # Handles CoinDCX API rate-limiting/timeouts gracefully
+            # API Timeout Failure Check
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle API blocked or unresponsive. Retrying next cycle.", "API Pause")
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Retrying next cycle.", "API Pause")
                 return
 
-            # Pure AI Autonomous Decision Making
             if best_candidate_coin and best_candidate_df_str:
                 client = Groq(api_key=GROQ_API_KEY)
                 system_prompt = """You are a ruthless quantitative crypto trader analyzing live candlestick data (OHLC), RSI, MACD Histogram, and Lower Bollinger Bands.
@@ -660,7 +655,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 27.0 (Cloudflare Bypass) • GPT-120B")
+st.sidebar.caption("Version 28.0 (Stable Router) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
