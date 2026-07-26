@@ -201,7 +201,7 @@ class GlobalBotEngine:
         self.last_prices = {}
         self.market_precision = {}
         self.market_min_qty = {}
-        self.market_pair_map = {} # ✨ FIX: Stores the exact, official API pair string
+        self.market_pair_map = {} 
         
         self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
@@ -246,25 +246,39 @@ class GlobalBotEngine:
         self.is_running = False
 
     def fetch_candle_data(self, coin, limit=40):
-        """✨ FIX: Fetches candles cleanly using exact pairs straight from the API Documentation."""
+        """✨ FIX: Checks exact pair mapped from API. Includes absolute fallback."""
         market = f"{coin}INR"
         pair = self.market_pair_map.get(market)
         
-        if not pair:
-            return None # Skip if CoinDCX doesn't actually support this market
+        # 1. Primary Method: Use the exact CoinDCX internal string
+        if pair:
+            url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit={limit}"
+            try:
+                res = requests.get(url, headers=REQ_HEADERS, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) >= 20:
+                        return data
+                elif res.status_code == 429:
+                    time.sleep(2) # Cloudflare rate limit cooling
+            except Exception:
+                pass
+            return None
             
-        url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit={limit}"
-        
-        try:
-            res = requests.get(url, headers=REQ_HEADERS, timeout=8)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) >= 20:
-                    return data
-            elif res.status_code == 429:
-                time.sleep(2) # Cloudflare rate limit cooling
-        except Exception:
-            pass
+        # 2. Secondary Method: Fallback if CoinDCX market map goes blank
+        prefixes = ["I", "B", "C"]
+        for prefix in prefixes:
+            fallback_pair = f"{prefix}-{coin}_INR"
+            url = f"https://public.coindcx.com/market_data/candles?pair={fallback_pair}&interval={self.candle_interval}&limit={limit}"
+            try:
+                res = requests.get(url, headers=REQ_HEADERS, timeout=8)
+                if res.status_code == 200:
+                    data = res.json()
+                    if isinstance(data, list) and len(data) >= 20:
+                        return data
+            except Exception:
+                pass
+            time.sleep(0.5)
             
         return None
 
@@ -322,10 +336,10 @@ class GlobalBotEngine:
             markets_res.raise_for_status()
             markets = markets_res.json()
             
-            # ✨ FIX: Extracts the official `pair` string directly as per CoinDCX documentation
-            self.market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
-            self.market_min_qty = {m['symbol']: float(m.get('min_quantity', 0.0001)) for m in markets if 'symbol' in m}
-            self.market_pair_map = {m['symbol']: m.get('pair') for m in markets if 'symbol' in m}
+            # ✨ FIX: Extracts using correct CoinDCX key `coindcx_name` instead of Binance's `symbol`
+            self.market_precision = {m.get('coindcx_name'): int(m.get('target_currency_precision', 5)) for m in markets if m.get('coindcx_name')}
+            self.market_min_qty = {m.get('coindcx_name'): float(m.get('min_quantity', 0.0001)) for m in markets if m.get('coindcx_name')}
+            self.market_pair_map = {m.get('coindcx_name'): m.get('pair') for m in markets if m.get('coindcx_name')}
             
             tickers_res = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10)
             tickers_res.raise_for_status()
@@ -676,12 +690,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v39
+# Cache Buster v40
 @st.cache_resource
-def get_bot_engine_v39():
+def get_bot_engine_v40():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v39()
+bot = get_bot_engine_v40()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -744,7 +758,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 39.0 (API Direct Pair Maps) • GPT-120B")
+st.sidebar.caption("Version 40.0 (API Map Fix) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
