@@ -7,6 +7,7 @@ import hashlib
 import requests
 import math
 import threading
+import os
 from groq import Groq
 from datetime import datetime, timezone, timedelta
 
@@ -66,7 +67,7 @@ class GoogleSheetsManager:
 
             self.trades_sheet = self.spreadsheet.sheet1
             if not self.trades_sheet.get_all_values():
-                headers = ["timestamp", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
+                headers = ["Date & Time (IST)", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
                 self.trades_sheet.append_row(headers)
 
             try:
@@ -83,14 +84,30 @@ class GoogleSheetsManager:
             return False
 
     def load_trades(self):
+        """Loads historical trades and handles both raw float timestamps and new IST strings."""
         if not self.trades_sheet and not self.connect():
             return []
         try:
             records = self.trades_sheet.get_all_records()
             parsed_records = []
             for row in records:
+                raw_ts = row.get("timestamp", row.get("Date & Time (IST)", 0))
+                
+                # Check if it's a readable date string or an old raw timestamp
+                try:
+                    ts = float(raw_ts)
+                except ValueError:
+                    # Parse the IST string back into a computer timestamp
+                    try:
+                        dt_obj = datetime.strptime(str(raw_ts), "%Y-%m-%d %I:%M:%S %p")
+                        ist_offset = timedelta(hours=5, minutes=30)
+                        utc_dt = dt_obj - ist_offset
+                        ts = utc_dt.replace(tzinfo=timezone.utc).timestamp()
+                    except Exception:
+                        ts = time.time() # Failsafe
+                        
                 parsed_records.append({
-                    "timestamp": float(row.get("timestamp", 0)),
+                    "timestamp": ts,
                     "coin": str(row.get("coin", "")),
                     "entry_price": float(row.get("entry_price", 0)),
                     "exit_price": float(row.get("exit_price", 0)),
@@ -108,8 +125,13 @@ class GoogleSheetsManager:
         if not self.trades_sheet and not self.connect():
             return
         try:
+            # Convert timestamp to human-readable IST for Sheet1
+            ist_offset = timedelta(hours=5, minutes=30)
+            utc_dt = datetime.fromtimestamp(trade_record["timestamp"], tz=timezone.utc)
+            ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+            
             row = [
-                trade_record["timestamp"],
+                ist_time,
                 trade_record["coin"],
                 trade_record["entry_price"],
                 trade_record["exit_price"],
@@ -146,19 +168,16 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. PRO-TRADER PORTFOLIO ENGINE
+# 3. AUTONOMOUS PRO-TRADER PORTFOLIO ENGINE
 # ==========================================
 class GlobalBotEngine:
-    # ✨ ZOMBIE KILLER REGISTRY: Tracks running bots
     _active_instances = []
 
     def __init__(self):
-        # 1. Terminate all old ghost threads before starting a new one
+        # Terminate older duplicate background threads
         for old_bot in GlobalBotEngine._active_instances:
             old_bot.is_running = False
         GlobalBotEngine._active_instances.clear()
-        
-        # 2. Register this new bot as the true active bot
         GlobalBotEngine._active_instances.append(self)
 
         self.is_running = False
@@ -226,10 +245,11 @@ class GlobalBotEngine:
             sleep_seconds = int(self.check_interval * 60)
             for _ in range(sleep_seconds):
                 if not self.is_running:
-                    break  # Kills the zombie thread immediately
+                    break
                 time.sleep(1)
 
     def _execute_cycle(self):
+        # 1. Fetch Balances
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
@@ -242,12 +262,14 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
+        # 2. Market Tickers
         markets = requests.get("https://api.coindcx.com/exchange/v1/markets_details").json()
         market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
         
         tickers = requests.get("https://api.coindcx.com/exchange/ticker").json()
         self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
 
+        # 3. Wallet Sync Recovery & Cleanup
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -267,6 +289,9 @@ class GlobalBotEngine:
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Coin missing from wallet. Assuming external/manual sell.", "Wallet Sync")
                 del self.active_positions[coin]
 
+        # =========================================================================
+        # 4. THE GUARDIAN AI: Manages ACTIVE positions to SELL at peak profit
+        # =========================================================================
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -282,58 +307,62 @@ class GlobalBotEngine:
             
             try:
                 url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                candles_data = requests.get(url).json()
-                df = pd.DataFrame(candles_data)
-                df['close'] = df['close'].astype(float)
-                df = df.sort_values(by='time', ascending=True)
-                
-                delta = df['close'].diff()
-                gain = delta.clip(lower=0)
-                loss = -1 * delta.clip(upper=0)
-                avg_gain = gain.rolling(window=14).mean()
-                avg_loss = loss.rolling(window=14).mean()
-                rs = avg_gain / avg_loss
-                df['RSI'] = 100 - (100 / (1 + rs))
-
-                exp1 = df['close'].ewm(span=12, adjust=False).mean()
-                exp2 = df['close'].ewm(span=26, adjust=False).mean()
-                df['MACD'] = exp1 - exp2
-                df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-                df['MACD_Hist'] = df['MACD'] - df['Signal']
-
-                df['SMA_20'] = df['close'].rolling(window=20).mean()
-                df['STD_20'] = df['close'].rolling(window=20).std()
-                df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
-                
-                latest_rsi = df['RSI'].iloc[-1]
-                
-                if latest_rsi > 60 or curr_price >= df['Upper_BB'].iloc[-1]:
-                    df['time'] = pd.to_datetime(df['time'], unit='ms')
-                    df_str = df[['time', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
+                res = requests.get(url, timeout=8)
+                candles_data = res.json()
+                if isinstance(candles_data, list) and len(candles_data) >= 20:
+                    df = pd.DataFrame(candles_data)
+                    df['close'] = df['close'].astype(float)
+                    df['high'] = df['high'].astype(float)
+                    df['low'] = df['low'].astype(float)
+                    df = df.sort_values(by='time', ascending=True)
                     
-                    client = Groq(api_key=GROQ_API_KEY)
-                    sell_prompt = """You are a ruthless, highly profitable quantitative crypto trader managing a HELD position.
-                    Your goal is to maximize ROI and lock in profits at absolute peaks.
-                    Analyze the RSI, MACD Histogram (momentum), and Upper Bollinger Band.
-                    - If price is hitting/exceeding the Upper_BB AND MACD momentum is dying or RSI > 65, output 'SELL' to secure max profit.
-                    - Otherwise, if the trend is still strong, output 'HOLD' to let profits run.
-                    Respond ONLY with JSON: {"action": "SELL" or "HOLD", "reasoning": "1 sentence explanation"}"""
+                    delta = df['close'].diff()
+                    gain = delta.clip(lower=0)
+                    loss = -1 * delta.clip(upper=0)
+                    avg_gain = gain.rolling(window=14).mean()
+                    avg_loss = loss.rolling(window=14).mean()
+                    rs = avg_gain / avg_loss
+                    df['RSI'] = 100 - (100 / (1 + rs))
+
+                    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+                    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+                    df['MACD'] = exp1 - exp2
+                    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+                    df['MACD_Hist'] = df['MACD'] - df['Signal']
+
+                    df['SMA_20'] = df['close'].rolling(window=20).mean()
+                    df['STD_20'] = df['close'].rolling(window=20).std()
+                    df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
                     
-                    response = client.chat.completions.create(
-                        model="openai/gpt-oss-120b",
-                        messages=[
-                            {"role": "system", "content": sell_prompt},
-                            {"role": "user", "content": f"Held coin {market} metrics:\n\n{df_str}"}
-                        ],
-                        response_format={"type": "json_object"},
-                        temperature=0.1
-                    )
-                    decision_data = json.loads(response.choices[0].message.content)
-                    if decision_data.get("action", "").upper() == "SELL":
-                        ai_sell_signal = True
-                        ai_reason = decision_data.get("reasoning", "AI locked in maximum profit at peak.")
-                    else:
-                        self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI letting profits run."), "Trailing Peak")
+                    latest_rsi = df['RSI'].iloc[-1]
+                    
+                    if latest_rsi > 58 or curr_price >= df['Upper_BB'].iloc[-1]:
+                        df['time'] = pd.to_datetime(df['time'], unit='ms')
+                        df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
+                        
+                        client = Groq(api_key=GROQ_API_KEY)
+                        sell_prompt = """You are an elite quantitative crypto hedge fund manager.
+                        Analyze the raw candlestick data (OHLC), RSI, MACD Histogram, and Upper Bollinger Band.
+                        Determine if the coin has reached a local peak or momentum is exhausting.
+                        - Output 'SELL' if price is overextended near/above Upper_BB and candle wicks/MACD show slowing buyer momentum.
+                        - Output 'HOLD' if the trend remains strong upwards.
+                        Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short concise sentence"}"""
+                        
+                        response = client.chat.completions.create(
+                            model="openai/gpt-oss-120b",
+                            messages=[
+                                {"role": "system", "content": sell_prompt},
+                                {"role": "user", "content": f"Held asset {market} ({self.candle_interval} candles):\n\n{df_str}"}
+                            ],
+                            response_format={"type": "json_object"},
+                            temperature=0.1
+                        )
+                        decision_data = json.loads(response.choices[0].message.content)
+                        if decision_data.get("action", "").upper() == "SELL":
+                            ai_sell_signal = True
+                            ai_reason = decision_data.get("reasoning", "AI detected peak exhaustion.")
+                        else:
+                            self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
             except Exception:
                 pass
 
@@ -342,9 +371,9 @@ class GlobalBotEngine:
             
             if is_tp or is_sl or ai_sell_signal:
                 if is_tp:
-                    action_type, reasoning = "TAKE PROFIT", f"Hard Take-Profit triggered at +{pnl_pct:.2f}%."
+                    action_type, reasoning = "TAKE PROFIT", f"Hard Take-Profit hit (+{pnl_pct:.2f}%)."
                 elif is_sl:
-                    action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss triggered at {pnl_pct:.2f}%."
+                    action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss hit ({pnl_pct:.2f}%)."
                 else:
                     action_type, reasoning = "PRO AI SELL", ai_reason
                 
@@ -378,7 +407,6 @@ class GlobalBotEngine:
                             "type": action_type
                         }
                         self.completed_trades.append(trade_record)
-                        
                         gs_manager.append_trade(trade_record)
                         
                         self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
@@ -393,14 +421,18 @@ class GlobalBotEngine:
             self.cooldown_counter -= 1
             return
 
+        # =========================================================================
+        # 5. THE SCANNER AI: Hunts for new BUY opportunities
+        # =========================================================================
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
         if (current_invested + self.trade_amount) <= self.max_budget:
-            lowest_rsi = 100
-            best_coin = None
-            best_market = None
-            best_price = 0
-            best_df_str = ""
+            best_candidate_coin = None
+            best_candidate_market = None
+            best_candidate_price = 0
+            best_candidate_df_str = ""
+            best_setup_score = -999.0
+            scan_success_count = 0
 
             for coin in self.candidates:
                 if coin in self.active_positions: continue
@@ -412,11 +444,23 @@ class GlobalBotEngine:
                 candle_pair = f"I-{coin}_INR"
                 try:
                     url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
-                    candles_data = requests.get(url).json()
+                    res = requests.get(url, timeout=8)
+                    candles_data = res.json()
+                    
+                    if not isinstance(candles_data, list) or len(candles_data) < 20:
+                        continue
+
                     df = pd.DataFrame(candles_data)
+                    if not {'close', 'high', 'low', 'open', 'time'}.issubset(df.columns):
+                        continue
+
+                    df['open'] = df['open'].astype(float)
+                    df['high'] = df['high'].astype(float)
+                    df['low'] = df['low'].astype(float)
                     df['close'] = df['close'].astype(float)
                     df = df.sort_values(by='time', ascending=True)
                     
+                    # Technical Indicators
                     delta = df['close'].diff()
                     gain = delta.clip(lower=0)
                     loss = -1 * delta.clip(upper=0)
@@ -436,85 +480,98 @@ class GlobalBotEngine:
                     df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
                     
                     latest_rsi = df['RSI'].iloc[-1]
+                    latest_close = df['close'].iloc[-1]
+                    lower_bb = df['Lower_BB'].iloc[-1]
                     
-                    if not pd.isna(latest_rsi) and latest_rsi < lowest_rsi:
-                        lowest_rsi = latest_rsi
-                        best_coin = coin
-                        best_market = market
-                        best_price = curr_price
+                    scan_success_count += 1
+                    
+                    # Score setups based on deep dips + momentum
+                    bb_distance_pct = ((latest_close - lower_bb) / lower_bb) * 100
+                    setup_score = (100.0 - latest_rsi) - (bb_distance_pct * 2)
+
+                    if setup_score > best_setup_score:
+                        best_setup_score = setup_score
+                        best_candidate_coin = coin
+                        best_candidate_market = market
+                        best_candidate_price = curr_price
                         df['time'] = pd.to_datetime(df['time'], unit='ms')
-                        best_df_str = df[['time', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
+                        best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
                 except Exception:
                     continue
 
-            if best_coin and lowest_rsi < 45:
+            # API Timeout Failure Check
+            if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX candle endpoint unresponsive. Retrying next cycle.", "API Pause")
+                return
+
+            if best_candidate_coin and best_candidate_df_str:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are a ruthless, highly profitable quantitative crypto trader.
-                You do not buy "falling knives". You only buy precise bounce setups.
-                Analyze the RSI, MACD Histogram, and Lower Bollinger Band (Lower_BB):
-                - If RSI < 45 AND price is bouncing off/near the Lower_BB AND MACD Histogram shows momentum shifting upward, output 'BUY'.
-                - If it is just crashing with no sign of slowing down, output 'HOLD'.
-                Respond ONLY with JSON: {"action": "BUY" or "HOLD", "reasoning": "1 sentence explanation"}"""
+                system_prompt = """You are a ruthless quantitative crypto trader analyzing live candlestick data (OHLC), RSI, MACD Histogram, and Lower Bollinger Bands.
+                Your task is to identify precision bounce setups and reject dangerous 'falling knives'.
+                
+                Evaluate the candlestick structure:
+                1. Look for rejection wicks at the low prices or candles closing higher than opens (bullish reversal).
+                2. Check if the MACD Histogram is curving upwards (loss of downward momentum).
+                3. Check if price is holding or bouncing near/above Lower Bollinger Band support.
+                
+                Respond ONLY in JSON format:
+                {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the price action"}"""
                 
                 try:
                     response = client.chat.completions.create(
                         model="openai/gpt-oss-120b",
                         messages=[
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Analyze metrics for {best_market} ({self.candle_interval} Chart):\n\n{best_df_str}"}
+                            {"role": "user", "content": f"Analyze candles for candidate {best_candidate_market} ({self.candle_interval} chart):\n\n{best_candidate_df_str}"}
                         ],
                         response_format={"type": "json_object"},
                         temperature=0.1
                     )
                     decision_data = json.loads(response.choices[0].message.content)
                     action = decision_data.get("action", "HOLD").upper()
-                    reasoning = decision_data.get("reasoning", "No reason provided.")
+                    reasoning = decision_data.get("reasoning", "AI evaluated market structure.")
 
                     if action == "BUY":
-                        precision = market_precision.get(best_market, 5)
+                        precision = market_precision.get(best_candidate_market, 5)
                         multiplier = 10 ** precision
-                        raw_crypto = self.trade_amount / best_price
+                        raw_crypto = self.trade_amount / best_candidate_price
                         
-                        if (raw_crypto * best_price) >= 101.0:
+                        if (raw_crypto * best_candidate_price) >= 101.0:
                             buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
                         else:
                             buy_crypto_amount = math.ceil(raw_crypto * multiplier) / multiplier
                             
-                        actual_cost = buy_crypto_amount * best_price
+                        actual_cost = buy_crypto_amount * best_candidate_price
                         
                         if actual_cost > self.inr_balance:
-                            self.log_trade("BUY SKIPPED", best_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
                         else:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                             order_body = {
                                 "side": "buy",
                                 "order_type": "market_order",
-                                "market": best_market,
+                                "market": best_candidate_market,
                                 "total_quantity": formatted_qty,
                                 "timestamp": int(round(time.time() * 1000))
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
-                                self.active_positions[best_coin] = {
+                                self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount,
-                                    "entry_price": best_price,
+                                    "entry_price": best_candidate_price,
                                     "invested": actual_cost
                                 }
-                                self.log_trade("BUY", best_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
+                                self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
                                 self.cooldown_counter = 2
                             else:
                                 err = res.get("message", "API Error")
-                                self.log_trade("BUY FAILED", best_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
+                                self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
-                        self.log_trade("PRO AI HOLD", best_coin, "0", f"₹{best_price:.2f}", reasoning, "Avoiding Falling Knife")
-                except Exception:
-                    pass
-            else:
-                display_coin = best_coin if best_coin else "N/A"
-                display_rsi = lowest_rsi if lowest_rsi != 100 else 0
-                self.log_trade("SCAN HOLD", display_coin, "0", f"₹{best_price:.2f}", f"Lowest RSI is {display_rsi:.1f}. Waiting for a drop below 45.", "Market Too High")
+                        self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "Candle Scan Hold")
+                except Exception as e:
+                    self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
         else:
-            self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Waiting for a sell.", "Budget Full")
+            self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
 @st.cache_resource
 def get_bot_engine():
@@ -583,8 +640,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 24.0 (Zombie Killer) • GPT-120B")
-
+st.sidebar.caption("Version 26.0 (Pro AI Guard) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -630,9 +686,6 @@ if page == "⚙️ Bot Engine & Settings":
 
     st.markdown("---")
     
-    # -----------------------------
-    # 🌩️ GOOGLE SHEETS DIAGNOSTICS
-    # -----------------------------
     st.subheader("☁️ Cloud Storage Connection Status")
     is_connected = gs_manager.connect()
     
