@@ -186,11 +186,6 @@ class GlobalBotEngine:
         self.trade_log = []
         self.thread = None
         
-        # Persistent HTTP Session
-        self.session = requests.Session()
-        self.session.headers.update(REQ_HEADERS)
-        
-        # Fixed 5 Core Assets Default
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.enable_bear_shield = True
         
@@ -206,6 +201,7 @@ class GlobalBotEngine:
         self.last_prices = {}
         self.market_precision = {}
         self.market_min_qty = {}
+        self.ecode_map = {}
         
         self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
@@ -249,25 +245,38 @@ class GlobalBotEngine:
     def stop(self):
         self.is_running = False
 
-    def fetch_candle_data(self, coin):
-        """Fetches candles cleanly using I- or B- prefixes with robust fallback."""
-        prefixes = ["I", "B"]
+    def fetch_candle_data(self, coin, limit=40):
+        """Fetches charts safely by opening a fresh socket and cycling through dynamic E-Codes."""
+        market = f"{coin}INR"
+        ecode = self.ecode_map.get(market, "B")
+        
+        # Priority list of prefixes (Primary ecode first, then safe fallbacks)
+        prefixes = []
+        if ecode not in prefixes: prefixes.append(ecode)
+        if "I" not in prefixes: prefixes.append("I")
+        if "B" not in prefixes: prefixes.append("B")
+        if "C" not in prefixes: prefixes.append("C")
+        
         for prefix in prefixes:
             pair = f"{prefix}-{coin}_INR"
-            url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit=40"
+            url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit={limit}"
             try:
-                res = self.session.get(url, timeout=8)
+                # Use a fresh request object, NO persistent session tunneling!
+                res = requests.get(url, headers=REQ_HEADERS, timeout=8)
                 if res.status_code == 200:
                     data = res.json()
                     if isinstance(data, list) and len(data) >= 20:
                         return data
+                elif res.status_code == 429:
+                    time.sleep(2) # Rate limit cooling
             except Exception:
                 pass
+            time.sleep(0.5)
         return None
 
     def check_market_regime(self):
         """Checks BTC 50-SMA trend for macro bear market shield."""
-        candles = self.fetch_candle_data("BTC")
+        candles = self.fetch_candle_data("BTC", limit=60)
         if candles:
             try:
                 df = pd.DataFrame(candles)
@@ -315,12 +324,13 @@ class GlobalBotEngine:
 
         # 2. Fetch Market Details & Tickers
         try:
-            markets_res = self.session.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=10)
+            markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", headers=REQ_HEADERS, timeout=10)
             markets = markets_res.json()
             self.market_precision = {m['symbol']: int(m.get('target_currency_precision', 5)) for m in markets if 'symbol' in m}
             self.market_min_qty = {m['symbol']: float(m.get('min_quantity', 0.0001)) for m in markets if 'symbol' in m}
+            self.ecode_map = {m['symbol']: m.get('ecode', 'I') for m in markets if 'symbol' in m}
             
-            tickers_res = self.session.get("https://api.coindcx.com/exchange/ticker", timeout=10)
+            tickers_res = requests.get("https://api.coindcx.com/exchange/ticker", headers=REQ_HEADERS, timeout=10)
             tickers = tickers_res.json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
         except Exception:
@@ -409,7 +419,7 @@ class GlobalBotEngine:
             ai_reason = ""
             
             candles_data = self.fetch_candle_data(coin)
-            time.sleep(2.0) # Safety delay
+            time.sleep(1.5) # Safety delay
             
             if candles_data:
                 try:
@@ -540,7 +550,7 @@ class GlobalBotEngine:
                 if not curr_price: continue
                 
                 candles_data = self.fetch_candle_data(coin)
-                time.sleep(2.0) # 2-second buffer prevents DDoS rate limits
+                time.sleep(1.5) # Anti-DDoS delay
                 
                 if candles_data:
                     try:
@@ -589,7 +599,7 @@ class GlobalBotEngine:
                         continue
 
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX endpoints temporary delay. Retrying next cycle.", "API Pause")
+                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "Fresh socket endpoints unresponsive. Retrying next cycle.", "API Pause")
                 return
 
             if best_candidate_coin and best_candidate_df_str:
@@ -667,12 +677,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v37
+# Cache Buster v38
 @st.cache_resource
-def get_bot_engine_v37():
+def get_bot_engine_v38():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v37()
+bot = get_bot_engine_v38()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -735,7 +745,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 37.0 (Top 5 Core Assets) • GPT-120B")
+st.sidebar.caption("Version 38.0 (Dead-Tunnel Fix & E-code Router) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
