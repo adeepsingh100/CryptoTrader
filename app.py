@@ -42,7 +42,6 @@ def coindcx_auth_post(endpoint, body):
     try:
         res = requests.post(url, data=json_body, headers=headers)
         
-        # ✨ FIX: Safely parse the JSON response to capture the EXACT error message from CoinDCX
         try:
             data = res.json()
         except Exception:
@@ -86,13 +85,11 @@ class GoogleSheetsManager:
             self.client = gspread.authorize(creds)
             self.spreadsheet = self.client.open(SHEET_NAME)
 
-            # 1. Trades Tab
             self.trades_sheet = self.spreadsheet.sheet1
             if not self.trades_sheet.get_all_values():
                 headers = ["Date & Time (IST)", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
                 self.trades_sheet.append_row(headers)
 
-            # 2. Execution Logs Tab
             try:
                 self.logs_sheet = self.spreadsheet.worksheet("ExecutionLogs")
             except Exception:
@@ -100,7 +97,6 @@ class GoogleSheetsManager:
                 headers = ["Time (IST)", "Action", "Coin", "Quantity", "Value (INR)", "Reasoning", "Status"]
                 self.logs_sheet.append_row(headers)
                 
-            # 3. API Errors Tab
             try:
                 self.errors_sheet = self.spreadsheet.worksheet("APIErrors")
             except Exception:
@@ -207,9 +203,6 @@ class GoogleSheetsManager:
 
 gs_manager = GoogleSheetsManager()
 
-# ==========================================
-# DEDICATED API ERROR LOGGER
-# ==========================================
 def log_api_failure(endpoint, error_msg):
     ts = time.time()
     ist_offset = timedelta(hours=5, minutes=30)
@@ -283,7 +276,7 @@ class GlobalBotEngine:
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
-                self.candidates = [] # Will fetch dynamically on cycle 1
+                self.candidates = [] 
             else:
                 raw_coins = [c.strip().upper() for c in candidate_str.split(",") if c.strip()]
                 self.candidates = raw_coins if raw_coins else ["BTC", "ETH", "SOL", "XRP", "DOGE"]
@@ -355,7 +348,6 @@ class GlobalBotEngine:
                 time.sleep(1)
 
     def _execute_cycle(self):
-        # 1. Fetch User Balances
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         
@@ -368,7 +360,6 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR':
                         self.inr_balance = bal
 
-        # 2. Fetch Market Details & Tickers
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=10)
             markets_res.raise_for_status()
@@ -383,14 +374,12 @@ class GlobalBotEngine:
             tickers = tickers_res.json()
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
             
-            # --- AUTO TOP COINS FEATURE ---
             if self.auto_top_n > 0 and len(self.candidates) == 0:
                 inr_markets = []
                 for t in tickers:
                     market = t.get('market', '')
                     if market.endswith('INR'):
                         base_coin = market[:-3]
-                        # Exclude stablecoins from dynamic scanning
                         if base_coin not in ['USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI']:
                             try:
                                 vol = float(t.get('volume', 0))
@@ -399,10 +388,7 @@ class GlobalBotEngine:
                             except Exception:
                                 pass
                 
-                # Sort by highest traded volume (INR quote volume)
                 inr_markets.sort(key=lambda x: x[1], reverse=True)
-                
-                # Assign top N base coins
                 self.candidates = [m[0] for m in inr_markets[:self.auto_top_n]]
                 self.log_trade("SYSTEM", "AUTO-SCAN", str(self.auto_top_n), "₹0.00", f"Auto-selected top {self.auto_top_n} volatile coins by 24h volume.", "Info")
 
@@ -411,7 +397,6 @@ class GlobalBotEngine:
             self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API. Retrying next cycle.", "API Pause")
             return
 
-        # 3. Sync Existing Wallet Holdings
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -431,7 +416,6 @@ class GlobalBotEngine:
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
                 del self.active_positions[coin]
 
-        # 4. Bear Shield Check
         if self.enable_bear_shield:
             market_state = self.check_market_regime()
             time.sleep(1.5) 
@@ -452,7 +436,7 @@ class GlobalBotEngine:
                             "side": "sell",
                             "order_type": "market_order",
                             "market": market,
-                            "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
+                            "total_quantity": float(formatted_qty), 
                             "timestamp": int(round(time.time() * 1000))
                         }
                         res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -480,7 +464,6 @@ class GlobalBotEngine:
                 self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active; pausing new buys.", "Shield Active")
                 return 
 
-        # 5. Manage Active Positions (Exit AI)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -573,7 +556,7 @@ class GlobalBotEngine:
                         "side": "sell",
                         "order_type": "market_order",
                         "market": market,
-                        "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
+                        "total_quantity": float(formatted_qty), 
                         "timestamp": int(round(time.time() * 1000))
                     }
                     res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -606,7 +589,6 @@ class GlobalBotEngine:
             self.cooldown_counter -= 1
             return
 
-        # 6. Entry AI: Scan candidates for new BUY opportunities
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
         if (current_invested + self.trade_amount) <= self.max_budget:
@@ -723,7 +705,10 @@ class GlobalBotEngine:
                             buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
                             actual_cost = buy_crypto_amount * best_candidate_price
 
-                        if actual_cost > self.inr_balance:
+                        # ✨ FIX: Strict Limit Enforcer
+                        if actual_cost > (self.trade_amount + 15.0):
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", f"Exchange min qty requires ₹{actual_cost:.2f}, exceeding your Position limit (₹{self.trade_amount}).", "Limit Enforced")
+                        elif actual_cost > self.inr_balance:
                             self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
                         else:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
@@ -731,7 +716,7 @@ class GlobalBotEngine:
                                 "side": "buy",
                                 "order_type": "market_order",
                                 "market": best_candidate_market,
-                                "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
+                                "total_quantity": float(formatted_qty), 
                                 "timestamp": int(round(time.time() * 1000))
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -754,12 +739,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v45
+# Cache Buster v46
 @st.cache_resource
-def get_bot_engine_v45():
+def get_bot_engine_v46():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v45()
+bot = get_bot_engine_v46()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -822,7 +807,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 45.0 (JSON Error Exposer + Float Fix)")
+st.sidebar.caption("Version 46.0 (Strict Position Limit Enforcer)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
