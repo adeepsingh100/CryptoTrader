@@ -138,7 +138,9 @@ class GoogleSheetsManager:
                     "invested": float(row.get("invested", 0)),
                     "pnl": float(row.get("pnl", 0)),
                     "pnl_pct": float(row.get("pnl_pct", 0)),
-                    "type": str(row.get("type", "CLOSE"))
+                    "type": str(row.get("type", "CLOSE")),
+                    "tp_price": float(row.get("tp_price", 0)),
+                    "sl_price": float(row.get("sl_price", 0))
                 })
             return parsed_records
         except Exception as e:
@@ -218,7 +220,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. LIGHTWEIGHT TOP-5 PRO-TRADER ENGINE
+# 3. INSTITUTIONAL PRO-TRADER ENGINE (v48)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -239,9 +241,7 @@ class GlobalBotEngine:
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
-        self.tp_pct = 2.0
-        self.sl_pct = 3.0
-        self.candle_interval = "15m" # Default locked
+        self.candle_interval = "15m" 
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -271,7 +271,7 @@ class GlobalBotEngine:
             
         gs_manager.append_log(log_entry)
 
-    def start(self, candidate_str, auto_top_n, enable_bear_shield, max_budget, trade_amount, tp_pct, sl_pct, candle_interval):
+    def start(self, candidate_str, auto_top_n, enable_bear_shield, max_budget, trade_amount, candle_interval):
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
@@ -283,8 +283,6 @@ class GlobalBotEngine:
             self.enable_bear_shield = enable_bear_shield
             self.max_budget = max_budget
             self.trade_amount = trade_amount
-            self.tp_pct = tp_pct
-            self.sl_pct = sl_pct
             self.candle_interval = candle_interval
             
             self.cooldown_counter = 0
@@ -296,7 +294,7 @@ class GlobalBotEngine:
         self.is_running = False
 
     def get_seconds_to_next_candle(self):
-        """Calculates exact milliseconds to the close of the current active candle + 2s buffer."""
+        """✨ NEW: Mathematical Clock-Lock. Calculates exact ms until the 15m candle closes + 1.5s latency buffer."""
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
         interval_sec = interval_map.get(self.candle_interval, 900)
         now = time.time()
@@ -304,16 +302,13 @@ class GlobalBotEngine:
         # Calculate exactly when the next candle block starts (e.g. 15m intervals -> xx:00, xx:15...)
         next_candle_time = ((now // interval_sec) + 1) * interval_sec
         
-        # Add a 2.0-second delay to account for Exchange API aggregation latency
-        return (next_candle_time - now) + 2.0
+        # Add a strict 1.5-second buffer to ensure the Exchange's OHLCV aggregation is fully complete
+        return (next_candle_time - now) + 1.5
 
     def fetch_candle_data(self, coin, interval=None, limit=40):
-        """✨ Updated to accept custom interval for HTF Multi-Timeframe mapping."""
         market_name = f"{coin}INR"
         pair = self.market_pair_string.get(market_name, f"B-{coin}_INR")
-        
         actual_interval = interval or self.candle_interval
-        
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={actual_interval}&limit={limit}"
         
         try:
@@ -330,12 +325,12 @@ class GlobalBotEngine:
 
     def check_htf_trend(self, coin):
         """
-        ✨ NEW: Institutional HTF (Higher Timeframe) Filter.
-        Fetches '1h' candles and calculates a 200 SMA (which mathematically equals a 4h SMA 50).
-        Ensures the bot ONLY buys if the price is above this macro trendline.
+        ✨ NEW: Institutional MTF Trend Filter.
+        Because CoinDCX lacks 4h API candles, we fetch '1h' candles and calculate a 200 EMA 
+        (Mathematically identical to a 4H 50-EMA). Bot only trades LONG if price > Macro Trend.
         """
         candles = self.fetch_candle_data(coin, interval="1h", limit=250)
-        time.sleep(1.0) # Prevent rate-limiting during HTF sweep
+        time.sleep(0.5) 
         
         if candles and len(candles) >= 200:
             try:
@@ -343,18 +338,17 @@ class GlobalBotEngine:
                 df['close'] = df['close'].astype(float)
                 df = df.sort_values(by='time', ascending=True)
                 
-                # Calculate the 200 Period SMA on 1H Chart (equiv to 4H 50-SMA)
-                df['SMA_200'] = df['close'].rolling(window=200).mean()
+                # Calculate 200 EMA on 1H Chart (Macro proxy for 4H 50-EMA)
+                df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
                 
                 latest_close = df['close'].iloc[-1]
-                latest_sma = df['SMA_200'].iloc[-1]
+                latest_ema = df['EMA_200'].iloc[-1]
                 
-                return latest_close > latest_sma
+                return latest_close > latest_ema # Returns True ONLY if in a Bullish Macro Trend
             except Exception as e:
                 log_api_failure("check_htf_trend (Pandas Error)", str(e))
                 
-        # Fallback true to prevent halting entirely if CoinDCX lacks enough history for a specific coin
-        return True 
+        return True # Failsafe if API lacks 200hr history for a new coin
 
     def check_market_regime(self):
         candles = self.fetch_candle_data("BTC", limit=60)
@@ -384,11 +378,10 @@ class GlobalBotEngine:
             except Exception as e:
                 self.log_trade("ERROR", "SYSTEM", "0", "₹0.00", f"Cycle Crash: {str(e)}", "Failed")
             
-            # ✨ FIX: Clock-Locked Sleep Buffer
             if not self.is_running: break
             sleep_seconds = self.get_seconds_to_next_candle()
             
-            # Uses a responsive 1-second loop so the "Stop Engine" button still works immediately
+            # Use responsive 1-second loop so the "Stop" button remains instant
             while sleep_seconds > 0 and self.is_running:
                 time.sleep(1)
                 sleep_seconds -= 1
@@ -443,6 +436,7 @@ class GlobalBotEngine:
             self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API. Retrying next cycle.", "API Pause")
             return
 
+        # 1. Sync Existing Holdings
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -450,10 +444,13 @@ class GlobalBotEngine:
                 if curr_price:
                     value = actual_balances[coin] * curr_price
                     if value > 50:
+                        # Legacy positions caught by sync won't have dynamic ATR targets initially
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
-                            "invested": value
+                            "invested": value,
+                            "tp_price": curr_price * 1.05, 
+                            "sl_price": curr_price * 0.95
                         }
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
@@ -462,9 +459,10 @@ class GlobalBotEngine:
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
                 del self.active_positions[coin]
 
+        # 2. Bear Shield Check (Macro Market Defense)
         if self.enable_bear_shield:
             market_state = self.check_market_regime()
-            time.sleep(1.5) 
+            time.sleep(0.5) 
             if market_state == "BEARISH":
                 for coin in list(self.active_positions.keys()):
                     market = f"{coin}INR"
@@ -480,8 +478,9 @@ class GlobalBotEngine:
                         formatted_qty = f"{sell_qty:.{precision}f}"
                         order_body = {
                             "side": "sell",
-                            "order_type": "market_order",
+                            "order_type": "limit_order", # ✨ FIX: Limit Order Fee Optimization
                             "market": market,
+                            "price_per_unit": float(curr_price),
                             "total_quantity": float(formatted_qty), 
                             "timestamp": int(round(time.time() * 1000))
                         }
@@ -510,6 +509,7 @@ class GlobalBotEngine:
                 self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active; pausing new buys.", "Shield Active")
                 return 
 
+        # 3. Manage Active Positions (Dynamic ATR Exit AI)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -523,7 +523,7 @@ class GlobalBotEngine:
             ai_reason = ""
             
             candles_data = self.fetch_candle_data(coin)
-            time.sleep(1.5) 
+            time.sleep(0.5) 
             
             if candles_data:
                 try:
@@ -583,12 +583,13 @@ class GlobalBotEngine:
                 except Exception as e:
                     log_api_failure("groq_chat_completion_sell", str(e))
 
-            is_tp = pnl_pct >= self.tp_pct
-            is_sl = pnl_pct <= -self.sl_pct
+            # ✨ NEW: Volatility-Based Dynamic Targeting 
+            is_tp = curr_price >= pos.get('tp_price', float('inf'))
+            is_sl = curr_price <= pos.get('sl_price', 0.0)
             
             if is_tp or is_sl or ai_sell_signal:
-                if is_tp: action_type, reasoning = "TAKE PROFIT", f"Hard Take-Profit hit (+{pnl_pct:.2f}%)."
-                elif is_sl: action_type, reasoning = "STOP LOSS", f"Hard Stop-Loss hit ({pnl_pct:.2f}%)."
+                if is_tp: action_type, reasoning = "TAKE PROFIT", f"ATR Target Hit (+{pnl_pct:.2f}%)."
+                elif is_sl: action_type, reasoning = "STOP LOSS", f"ATR Stop Hit ({pnl_pct:.2f}%)."
                 else: action_type, reasoning = "PRO AI SELL", ai_reason
                 
                 precision = self.market_precision.get(market, 5)
@@ -600,8 +601,9 @@ class GlobalBotEngine:
                     formatted_qty = f"{sell_qty:.{precision}f}"
                     order_body = {
                         "side": "sell",
-                        "order_type": "market_order",
+                        "order_type": "limit_order", # ✨ FIX: Limit Order
                         "market": market,
+                        "price_per_unit": float(curr_price),
                         "total_quantity": float(formatted_qty), 
                         "timestamp": int(round(time.time() * 1000))
                     }
@@ -635,6 +637,7 @@ class GlobalBotEngine:
             self.cooldown_counter -= 1
             return
 
+        # 4. Scan Candidates for New Buys
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
         if (current_invested + self.trade_amount) <= self.max_budget:
@@ -643,6 +646,7 @@ class GlobalBotEngine:
             best_candidate_price = 0
             best_candidate_df_str = ""
             best_setup_score = -999.0
+            best_atr = 0.0
             scan_success_count = 0
 
             for coin in self.candidates:
@@ -652,13 +656,13 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                # ✨ NEW: Institutional HTF Trend Filter Check
+                # ✨ NEW: MTF Trend Filter (No buying below the Macro Line)
                 if not self.check_htf_trend(coin):
                     # Silently skip buying if asset is in a macro downtrend
                     continue
                 
                 candles_data = self.fetch_candle_data(coin)
-                time.sleep(1.5) 
+                time.sleep(0.5) 
                 
                 if candles_data:
                     try:
@@ -668,6 +672,15 @@ class GlobalBotEngine:
                         df['low'] = df['low'].astype(float)
                         df['close'] = df['close'].astype(float)
                         df = df.sort_values(by='time', ascending=True)
+                        
+                        # Calculate ATR(14) dynamically
+                        df['prev_close'] = df['close'].shift(1)
+                        df['tr1'] = df['high'] - df['low']
+                        df['tr2'] = (df['high'] - df['prev_close']).abs()
+                        df['tr3'] = (df['low'] - df['prev_close']).abs()
+                        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+                        df['ATR'] = df['tr'].rolling(window=14).mean()
+                        latest_atr = df['ATR'].iloc[-1]
                         
                         delta = df['close'].diff()
                         gain = delta.clip(lower=0)
@@ -701,8 +714,9 @@ class GlobalBotEngine:
                             best_candidate_coin = coin
                             best_candidate_market = market
                             best_candidate_price = curr_price
+                            best_atr = latest_atr
                             df['time'] = pd.to_datetime(df['time'], unit='ms')
-                            best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
+                            best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ATR']].tail(8).to_string(index=False)
                     except Exception as e:
                         log_api_failure(f"Dataframe calculation ({coin})", str(e))
                         continue
@@ -757,24 +771,31 @@ class GlobalBotEngine:
                             actual_cost = buy_crypto_amount * best_candidate_price
 
                         if actual_cost > (self.trade_amount + 15.0):
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", f"Exchange min qty requires ₹{actual_cost:.2f}, exceeding your Position limit (₹{self.trade_amount}).", "Limit Enforced")
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", f"Exchange min qty requires ₹{actual_cost:.2f}, exceeding your limit.", "Limit Enforced")
                         elif actual_cost > self.inr_balance:
                             self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
                         else:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                             order_body = {
                                 "side": "buy",
-                                "order_type": "market_order",
+                                "order_type": "limit_order", # ✨ FIX: Limit Orders exclusively
                                 "market": best_candidate_market,
+                                "price_per_unit": float(best_candidate_price),
                                 "total_quantity": float(formatted_qty), 
                                 "timestamp": int(round(time.time() * 1000))
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
+                                # ✨ NEW: Volatility Scaled Risk Management parameters stored locally
+                                target_tp = best_candidate_price + (3.0 * best_atr)
+                                target_sl = best_candidate_price - (1.5 * best_atr)
+                                
                                 self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount,
                                     "entry_price": best_candidate_price,
-                                    "invested": actual_cost
+                                    "invested": actual_cost,
+                                    "tp_price": target_tp,
+                                    "sl_price": target_sl
                                 }
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
                                 self.cooldown_counter = 2
@@ -789,12 +810,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v47
+# Cache Buster v48
 @st.cache_resource
-def get_bot_engine_v47():
+def get_bot_engine_v48():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v47()
+bot = get_bot_engine_v48()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -857,7 +878,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 47.0 (Institutional Clock-Lock & HTF Filter)")
+st.sidebar.caption("Version 48.0 (Institutional Optimization)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -889,7 +910,7 @@ if page == "⚙️ Bot Engine & Settings":
             
     with col2:
         timeframes = ["1m", "15m", "1h", "1d"]
-        default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 2
+        default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 1
         candle_interval = st.selectbox(
             "Candle Timeframe (Chart Size)", 
             timeframes, 
@@ -897,27 +918,26 @@ if page == "⚙️ Bot Engine & Settings":
         )
     
     enable_bear_shield = st.checkbox(
-        "🛡️ Enable Macro Market Bear Shield", 
+        "🛡️ Enable Macro Market Bear Shield (BTC 50-SMA)", 
         value=bool(bot.enable_bear_shield),
-        help="Monitors Bitcoin 50-SMA trend. Liquidates open positions to cash (INR) and pauses new buys when market turns bearish."
+        help="Liquidates open positions to cash (INR) and pauses new buys when Bitcoin drops below 50-SMA."
     )
 
     st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
     colA, colB = st.columns(2)
     with colA:
         max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
-        tp_pct = st.number_input("Take-Profit Target (%)", min_value=0.5, value=float(bot.tp_pct), step=0.5)
     with colB:
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
-        sl_pct = st.number_input("Stop-Loss Limit (%)", min_value=0.5, value=float(bot.sl_pct), step=0.5)
         
-    st.info(f"⏱️ **Precision Clock-Locking Active:** The bot's execution timer is automatically locked to trigger exactly upon the closure of the selected **{candle_interval}** candle (+2s buffer).", icon="🔒")
+    st.info(f"📈 **Dynamic Risk Engine:** Static targets have been replaced with live volatility tracking. Take-Profit is automatically locked to **3.0x ATR(14)**, and Stop-Loss dynamically trails at **1.5x ATR(14)**.", icon="⚙️")
+    st.info(f"⏱️ **Precision Clock-Locking:** The bot's execution timer is mathematically locked to trigger exactly upon the closure of the selected **{candle_interval}** candle (+1.5s latency buffer).", icon="🔒")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(candidate_input, top_n, enable_bear_shield, max_bud, trade_amt, tp_pct, sl_pct, candle_interval)
+            bot.start(candidate_input, top_n, enable_bear_shield, max_bud, trade_amt, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
