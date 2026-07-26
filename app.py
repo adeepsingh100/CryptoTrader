@@ -41,8 +41,21 @@ def coindcx_auth_post(endpoint, body):
     
     try:
         res = requests.post(url, data=json_body, headers=headers)
-        res.raise_for_status() 
-        return res.json()
+        
+        # ✨ FIX: Safely parse the JSON response to capture the EXACT error message from CoinDCX
+        try:
+            data = res.json()
+        except Exception:
+            res.raise_for_status()
+            return {"error": "Failed to parse CoinDCX API response"}
+            
+        if res.status_code != 200:
+            err_msg = data.get("message", data.get("error", str(data)))
+            log_api_failure(endpoint, f"HTTP {res.status_code}: {err_msg}")
+            return {"error": err_msg}
+            
+        return data
+        
     except Exception as e:
         log_api_failure(endpoint, str(e))
         return {"error": str(e)}
@@ -439,7 +452,7 @@ class GlobalBotEngine:
                             "side": "sell",
                             "order_type": "market_order",
                             "market": market,
-                            "total_quantity": formatted_qty,
+                            "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
                             "timestamp": int(round(time.time() * 1000))
                         }
                         res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -560,7 +573,7 @@ class GlobalBotEngine:
                         "side": "sell",
                         "order_type": "market_order",
                         "market": market,
-                        "total_quantity": formatted_qty,
+                        "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
                         "timestamp": int(round(time.time() * 1000))
                     }
                     res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -586,7 +599,7 @@ class GlobalBotEngine:
                         self.cooldown_counter = 2
                         return
                     else:
-                        err = res.get("message", res.get("error", "API Error"))
+                        err = res.get("error", "API Error")
                         self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{actual_value:.2f}", f"Rejected: {err}", "Error")
 
         if self.cooldown_counter > 0:
@@ -718,7 +731,7 @@ class GlobalBotEngine:
                                 "side": "buy",
                                 "order_type": "market_order",
                                 "market": best_candidate_market,
-                                "total_quantity": formatted_qty,
+                                "total_quantity": float(formatted_qty), # ✨ FIX: Passed as Float
                                 "timestamp": int(round(time.time() * 1000))
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
@@ -731,7 +744,7 @@ class GlobalBotEngine:
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
                                 self.cooldown_counter = 2
                             else:
-                                err = res.get("message", res.get("error", "API Error"))
+                                err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
                         self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "Candle Scan Hold")
@@ -741,12 +754,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v44
+# Cache Buster v45
 @st.cache_resource
-def get_bot_engine_v44():
+def get_bot_engine_v45():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v44()
+bot = get_bot_engine_v45()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -809,7 +822,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 44.0 (Top Coins Scanner + Strict Timeframes)")
+st.sidebar.caption("Version 45.0 (JSON Error Exposer + Float Fix)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -840,7 +853,6 @@ if page == "⚙️ Bot Engine & Settings":
             candidate_input = ""
             
     with col2:
-        # STRICT Intervals required by CoinDCX Public API
         timeframes = ["1m", "15m", "1h", "1d"]
         default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 2
         candle_interval = st.selectbox(
