@@ -38,7 +38,14 @@ def coindcx_auth_post(endpoint, body):
         'X-AUTH-APIKEY': API_KEY,
         'X-AUTH-SIGNATURE': signature
     }
-    return requests.post(url, data=json_body, headers=headers).json()
+    
+    try:
+        res = requests.post(url, data=json_body, headers=headers)
+        res.raise_for_status() # Force exception on HTTP errors (4xx, 5xx)
+        return res.json()
+    except Exception as e:
+        log_api_failure(endpoint, str(e))
+        return {"error": str(e)}
 
 # ==========================================
 # 2. CACHED & RELIABLE GOOGLE SHEETS MANAGER
@@ -52,6 +59,7 @@ class GoogleSheetsManager:
         self.spreadsheet = None
         self.trades_sheet = None
         self.logs_sheet = None
+        self.errors_sheet = None
         self.last_error = None
 
     def connect(self):
@@ -65,17 +73,27 @@ class GoogleSheetsManager:
             self.client = gspread.authorize(creds)
             self.spreadsheet = self.client.open(SHEET_NAME)
 
+            # 1. Trades Tab
             self.trades_sheet = self.spreadsheet.sheet1
             if not self.trades_sheet.get_all_values():
                 headers = ["Date & Time (IST)", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
                 self.trades_sheet.append_row(headers)
 
+            # 2. Execution Logs Tab
             try:
                 self.logs_sheet = self.spreadsheet.worksheet("ExecutionLogs")
             except Exception:
                 self.logs_sheet = self.spreadsheet.add_worksheet("ExecutionLogs", rows=2000, cols=7)
                 headers = ["Time (IST)", "Action", "Coin", "Quantity", "Value (INR)", "Reasoning", "Status"]
                 self.logs_sheet.append_row(headers)
+                
+            # 3. API Errors Tab
+            try:
+                self.errors_sheet = self.spreadsheet.worksheet("APIErrors")
+            except Exception:
+                self.errors_sheet = self.spreadsheet.add_worksheet("APIErrors", rows=1000, cols=3)
+                headers = ["Time (IST)", "API Endpoint", "Error Message"]
+                self.errors_sheet.append_row(headers)
 
             self.last_error = None
             return True
@@ -160,8 +178,41 @@ class GoogleSheetsManager:
             self.logs_sheet.append_row(row)
         except Exception as e:
             self.last_error = f"Append Log Error: {e}"
+            
+    def append_api_error(self, timestamp, endpoint, error_msg):
+        if not self.errors_sheet and not self.connect():
+            return
+        try:
+            ist_offset = timedelta(hours=5, minutes=30)
+            utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+            ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+
+            row = [ist_time, str(endpoint), str(error_msg)[:1000]]
+            self.errors_sheet.append_row(row)
+        except Exception as e:
+            self.last_error = f"Append API Error Failed: {e}"
 
 gs_manager = GoogleSheetsManager()
+
+# ==========================================
+# DEDICATED API ERROR LOGGER
+# ==========================================
+def log_api_failure(endpoint, error_msg):
+    """Logs API failures to local file and Google Sheets."""
+    ts = time.time()
+    ist_offset = timedelta(hours=5, minutes=30)
+    ist_time = (datetime.fromtimestamp(ts, tz=timezone.utc) + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
+    
+    # 1. Log locally to a new file
+    try:
+        with open("api-failures.log", "a") as f:
+            f.write(f"[{ist_time}] {endpoint} - {error_msg}\n")
+    except Exception:
+        pass
+        
+    # 2. Push to Google Sheets tab
+    if 'gs_manager' in globals():
+        gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
 # 3. LIGHTWEIGHT TOP-5 PRO-TRADER ENGINE
@@ -238,22 +289,22 @@ class GlobalBotEngine:
         self.is_running = False
 
     def fetch_candle_data(self, coin, limit=40):
-        """✨ RESTORED: Exactly how it worked yesterday. Simple, honest API calls."""
         pair = f"I-{coin}_INR"
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={self.candle_interval}&limit={limit}"
         
         try:
             res = requests.get(url, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) >= 20:
-                    return data
-        except Exception:
-            pass
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data, list) and len(data) >= 20:
+                return data
+            else:
+                log_api_failure(url, f"Unexpected data format or insufficient candles: {data}")
+        except Exception as e:
+            log_api_failure(url, str(e))
         return None
 
     def check_market_regime(self):
-        """Checks BTC 50-SMA trend for macro bear market shield."""
         candles = self.fetch_candle_data("BTC", limit=60)
         if candles:
             try:
@@ -269,8 +320,8 @@ class GlobalBotEngine:
                     return "BEARISH"
                 else:
                     return "BULLISH"
-            except Exception:
-                pass
+            except Exception as e:
+                log_api_failure("check_market_regime (Pandas Error)", str(e))
         return "NEUTRAL"
 
     def _run_loop(self):
@@ -315,7 +366,8 @@ class GlobalBotEngine:
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
             
         except Exception as e:
-            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API ({e}). Retrying next cycle.", "API Pause")
+            log_api_failure("markets_details or ticker", str(e))
+            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API. Retrying next cycle.", "API Pause")
             return
 
         # 3. Sync Existing Wallet Holdings
@@ -458,8 +510,8 @@ class GlobalBotEngine:
                             ai_reason = decision_data.get("reasoning", "AI detected peak exhaustion.")
                         else:
                             self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_api_failure("groq_chat_completion_sell", str(e))
 
             is_tp = pnl_pct >= self.tp_pct
             is_sl = pnl_pct <= -self.sl_pct
@@ -506,7 +558,7 @@ class GlobalBotEngine:
                         self.cooldown_counter = 2
                         return
                     else:
-                        err = res.get("message", "API Error")
+                        err = res.get("message", res.get("error", "API Error"))
                         self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{actual_value:.2f}", f"Rejected: {err}", "Error")
 
         if self.cooldown_counter > 0:
@@ -577,7 +629,8 @@ class GlobalBotEngine:
                             best_candidate_price = curr_price
                             df['time'] = pd.to_datetime(df['time'], unit='ms')
                             best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB']].tail(8).to_string(index=False)
-                    except Exception:
+                    except Exception as e:
+                        log_api_failure(f"Dataframe calculation ({coin})", str(e))
                         continue
 
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
@@ -650,21 +703,22 @@ class GlobalBotEngine:
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
                                 self.cooldown_counter = 2
                             else:
-                                err = res.get("message", "API Error")
+                                err = res.get("message", res.get("error", "API Error"))
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
                         self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "Candle Scan Hold")
                 except Exception as e:
+                    log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v41
+# Cache Buster v42
 @st.cache_resource
-def get_bot_engine_v41():
+def get_bot_engine_v42():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v41()
+bot = get_bot_engine_v42()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -727,7 +781,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 41.0 (Clean Network Restored) • GPT-120B")
+st.sidebar.caption("Version 42.0 (API Logging Enabled) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -795,7 +849,7 @@ if page == "⚙️ Bot Engine & Settings":
     is_connected = gs_manager.connect()
     
     if is_connected:
-        st.success(f"✅ Connected to Google Sheet (`{SHEET_NAME}`)! Found **Sheet1** (Trades) & **ExecutionLogs** tabs.")
+        st.success(f"✅ Connected to Google Sheet (`{SHEET_NAME}`)! Tracking Trades, Logs, and API Errors.")
     else:
         st.error(f"❌ Google Sheets Connection Failed: **{gs_manager.last_error}**")
 
@@ -854,8 +908,8 @@ elif page == "📊 Live Dashboard":
                 for t in tickers:
                     if 'market' in t:
                         live_prices[t['market']] = float(t['last_price'])
-        except Exception:
-            pass 
+        except Exception as e:
+            log_api_failure("Dashboard Balance/Ticker Fetch", str(e))
         
         ist_offset = timedelta(hours=5, minutes=30)
         now_ist = datetime.now(timezone.utc) + ist_offset
