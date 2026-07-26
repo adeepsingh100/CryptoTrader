@@ -658,14 +658,22 @@ class GlobalBotEngine:
                         multiplier = 10 ** precision
                         raw_crypto = self.trade_amount / best_candidate_price
                         
-                        buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
+                        # ✨ FIX: Round UP (ceil) to ensure we don't drop below the INR value limit
+                        buy_crypto_amount = math.ceil(raw_crypto * multiplier) / multiplier
                         
+                        # Apply minimum coin quantity
                         min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
                         if buy_crypto_amount < min_required_qty:
                             buy_crypto_amount = min_required_qty
                             
                         actual_cost = buy_crypto_amount * best_candidate_price
                         
+                        # ✨ FIX: Absolute Order Value Shield (Force > 105 INR)
+                        if actual_cost < 105.0:
+                            required_for_105 = 105.0 / best_candidate_price
+                            buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
+                            actual_cost = buy_crypto_amount * best_candidate_price
+
                         if actual_cost > self.inr_balance:
                             self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
                         else:
@@ -698,10 +706,10 @@ class GlobalBotEngine:
 
 # Cache Buster Name Change to kill any ghost threads permanently
 @st.cache_resource
-def get_bot_engine_v33():
+def get_bot_engine_v34():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v33()
+bot = get_bot_engine_v34()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -764,7 +772,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 33.0 (Macro Bear Shield) • GPT-120B")
+st.sidebar.caption("Version 34.0 (Order Value Shield) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
