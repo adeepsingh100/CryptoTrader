@@ -187,7 +187,8 @@ class GlobalBotEngine:
         self.thread = None
         
         self.auto_scan_count = 20
-        self.candidates = [] # Populated automatically
+        self.candidates = []
+        self.enable_bear_shield = True
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
@@ -224,9 +225,10 @@ class GlobalBotEngine:
             
         gs_manager.append_log(log_entry)
 
-    def start(self, auto_scan_count, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
+    def start(self, auto_scan_count, enable_bear_shield, max_budget, trade_amount, tp_pct, sl_pct, check_interval, candle_interval):
         if not self.is_running:
             self.auto_scan_count = auto_scan_count
+            self.enable_bear_shield = enable_bear_shield
             self.max_budget = max_budget
             self.trade_amount = trade_amount
             self.tp_pct = tp_pct
@@ -241,6 +243,30 @@ class GlobalBotEngine:
 
     def stop(self):
         self.is_running = False
+
+    def check_market_regime(self):
+        """Checks Bitcoin 50-SMA macro trend to detect bear markets."""
+        try:
+            url = f"https://public.coindcx.com/market_data/candles?pair=I-BTC_INR&interval=1h&limit=60"
+            res = requests.get(url, headers=REQ_HEADERS, timeout=8)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) >= 50:
+                    df = pd.DataFrame(data)
+                    df['close'] = df['close'].astype(float)
+                    df = df.sort_values(by='time', ascending=True)
+                    df['SMA_50'] = df['close'].rolling(window=50).mean()
+                    
+                    latest_close = df['close'].iloc[-1]
+                    latest_sma50 = df['SMA_50'].iloc[-1]
+                    
+                    if latest_close < latest_sma50:
+                        return "BEARISH"
+                    else:
+                        return "BULLISH"
+        except Exception:
+            pass
+        return "NEUTRAL"
 
     def fetch_candle_data(self, candle_pair):
         url = f"https://public.coindcx.com/market_data/candles?pair={candle_pair}&interval={self.candle_interval}&limit=40"
@@ -341,7 +367,60 @@ class GlobalBotEngine:
                 del self.active_positions[coin]
 
         # =========================================================================
-        # 4. THE GUARDIAN AI: Manages ACTIVE positions to SELL at peak profit
+        # 4. MACRO BEAR SHIELD CHECK (Hedging Filter)
+        # =========================================================================
+        if self.enable_bear_shield:
+            market_state = self.check_market_regime()
+            if market_state == "BEARISH":
+                # Emergency Cash-Out: Sell active altcoin holdings back into cash (INR)
+                liquidated_any = False
+                for coin in list(self.active_positions.keys()):
+                    market = f"{coin}INR"
+                    curr_price = self.last_prices.get(market, 0)
+                    pos = self.active_positions[coin]
+                    
+                    precision = self.market_precision.get(market, 5)
+                    multiplier = 10 ** precision
+                    sell_qty = math.floor(actual_balances.get(coin, 0) * multiplier) / multiplier
+                    actual_value = sell_qty * curr_price
+                    
+                    if actual_value >= 100.0:
+                        formatted_qty = f"{sell_qty:.{precision}f}"
+                        order_body = {
+                            "side": "sell",
+                            "order_type": "market_order",
+                            "market": market,
+                            "total_quantity": formatted_qty,
+                            "timestamp": int(round(time.time() * 1000))
+                        }
+                        res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
+                        if "orders" in res or "id" in res:
+                            profit_inr = actual_value - pos['invested']
+                            pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
+                            self.realized_pnl += profit_inr
+                            
+                            trade_record = {
+                                "timestamp": time.time(),
+                                "coin": coin,
+                                "entry_price": pos['entry_price'],
+                                "exit_price": curr_price,
+                                "invested": pos['invested'],
+                                "pnl": profit_inr,
+                                "pnl_pct": pnl_pct,
+                                "type": "BEAR LIQUIDATE"
+                            }
+                            self.completed_trades.append(trade_record)
+                            gs_manager.append_trade(trade_record)
+                            
+                            self.log_trade("BEAR SELL", coin, formatted_qty, f"₹{actual_value:.2f}", "Bear Shield Activated: Liquidated to cash (INR).", "Success")
+                            del self.active_positions[coin]
+                            liquidated_any = True
+
+                self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active; pausing new buys.", "Shield Active")
+                return # Skip buy scanning phase during market crash
+
+        # =========================================================================
+        # 5. THE GUARDIAN AI: Manages ACTIVE positions to SELL at peak profit
         # =========================================================================
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
@@ -472,7 +551,7 @@ class GlobalBotEngine:
             return
 
         # =========================================================================
-        # 5. THE SCANNER AI: Hunts the top volume coins for new BUY opportunities
+        # 6. THE SCANNER AI: Hunts the top volume coins for new BUY opportunities
         # =========================================================================
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
@@ -617,12 +696,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster Name Change to kill the V30 ghost thread permanently
+# Cache Buster Name Change to kill any ghost threads permanently
 @st.cache_resource
-def get_bot_engine_v32():
+def get_bot_engine_v33():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v32()
+bot = get_bot_engine_v33()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -685,7 +764,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 32.0 (Stable Autopilot) • GPT-120B")
+st.sidebar.caption("Version 33.0 (Macro Bear Shield) • GPT-120B")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -703,6 +782,8 @@ if page == "⚙️ Bot Engine & Settings":
     with col2:
         candle_interval = st.selectbox("Candle Timeframe (Chart Size)", ["15m", "30m", "1h", "4h", "1d"], index=2)
     
+    enable_bear_shield = st.checkbox("🛡️ Enable Macro Market Bear Shield", value=True, help="Monitors Bitcoin 50-SMA trend. Liquidates open positions to cash (INR) and pauses new buys when market turns bearish.")
+
     st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
     colA, colB = st.columns(2)
     with colA:
@@ -718,7 +799,7 @@ if page == "⚙️ Bot Engine & Settings":
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(auto_scan_count, max_bud, trade_amt, tp_pct, sl_pct, interval_input, candle_interval)
+            bot.start(auto_scan_count, enable_bear_shield, max_bud, trade_amt, tp_pct, sl_pct, interval_input, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -744,7 +825,8 @@ if page == "⚙️ Bot Engine & Settings":
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            st.info(f"⚡ **System Active:** Auto-scanning Top {len(bot.candidates)} High-Volume assets on {bot.candle_interval} timeframe | Interval: {bot.check_interval}m")
+            shield_status = "Shield Enabled" if bot.enable_bear_shield else "Shield Disabled"
+            st.info(f"⚡ **System Active:** Auto-scanning Top {len(bot.candidates)} High-Volume assets on {bot.candle_interval} timeframe | Interval: {bot.check_interval}m | Bear Shield: {shield_status}")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
