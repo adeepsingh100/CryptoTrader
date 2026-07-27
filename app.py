@@ -513,6 +513,7 @@ class GlobalBotEngine:
                 self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
 
     def _scan_for_entries(self):
+        # 1. Evaluate Active Positions (Early Exit Check)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -550,9 +551,13 @@ class GlobalBotEngine:
                                 self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Gross profit is in the Dead Zone and cannot clear the Exchange Fee/TDS hurdle.", "Tax Shield")
                             else:
                                 self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
+                        else:
+                            # ✨ FIX: Log AI Hold reasoning when checking active positions
+                            self.log_trade("AI HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", decision_data.get("reasoning", "AI decided to ride the trend."), "Trailing Peak")
                 except Exception as e:
                     log_api_failure("groq_chat_completion_sell", str(e))
 
+        # 2. Scan for New Entries
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
@@ -680,17 +685,18 @@ class GlobalBotEngine:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
-                        self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "MTF Scan Hold")
+                        # ✨ FIX: Log AI Hold reasoning when checking new entry candidates
+                        self.log_trade("AI HOLD (ENTRY)", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "MTF Scan Hold")
                 except Exception as e:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
 
-# Cache Buster v55
+# Cache Buster v56
 @st.cache_resource
-def get_bot_engine_v55():
+def get_bot_engine_v56():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v55()
+bot = get_bot_engine_v56()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -735,7 +741,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 55.0 (Live JS Timer & API Shield)")
+st.sidebar.caption("Version 56.0 (Hit Trigger Logging Added)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -806,7 +812,6 @@ if page == "⚙️ Bot Engine & Settings":
         if bot.is_running:
             asset_str = f"Auto-Scanning Top {bot.auto_top_n} Coins" if bot.auto_top_n > 0 and len(bot.candidates) == 0 else f"{len(bot.candidates)} assets ({', '.join(bot.candidates)})"
             
-            # ✨ NEW: Client-Side Javascript Live Timer
             timer_html = f"""
             <!DOCTYPE html>
             <html>
