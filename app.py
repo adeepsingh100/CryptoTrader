@@ -41,7 +41,6 @@ def coindcx_auth_post(endpoint, body):
     
     try:
         res = requests.post(url, data=json_body, headers=headers)
-        
         try:
             data = res.json()
         except Exception:
@@ -52,9 +51,7 @@ def coindcx_auth_post(endpoint, body):
             err_msg = data.get("message", data.get("error", str(data)))
             log_api_failure(endpoint, f"HTTP {res.status_code}: {err_msg}")
             return {"error": err_msg}
-            
         return data
-        
     except Exception as e:
         log_api_failure(endpoint, str(e))
         return {"error": str(e)}
@@ -87,7 +84,7 @@ class GoogleSheetsManager:
 
             self.trades_sheet = self.spreadsheet.sheet1
             if not self.trades_sheet.get_all_values():
-                headers = ["Date & Time (IST)", "coin", "entry_price", "exit_price", "invested", "pnl", "pnl_pct", "type"]
+                headers = ["Date & Time (IST)", "coin", "entry_price", "exit_price", "invested", "net_pnl", "net_pnl_pct", "type"]
                 self.trades_sheet.append_row(headers)
 
             try:
@@ -118,7 +115,6 @@ class GoogleSheetsManager:
             parsed_records = []
             for row in records:
                 raw_ts = row.get("timestamp", row.get("Date & Time (IST)", 0))
-                
                 try:
                     ts = float(raw_ts)
                 except ValueError:
@@ -129,18 +125,21 @@ class GoogleSheetsManager:
                         ts = utc_dt.replace(tzinfo=timezone.utc).timestamp()
                     except Exception:
                         ts = time.time()
-                        
+                
+                pnl_val = float(row.get("net_pnl", row.get("pnl", 0)))
+                pnl_pct_val = float(row.get("net_pnl_pct", row.get("pnl_pct", 0)))
+
                 parsed_records.append({
                     "timestamp": ts,
                     "coin": str(row.get("coin", "")),
                     "entry_price": float(row.get("entry_price", 0)),
                     "exit_price": float(row.get("exit_price", 0)),
                     "invested": float(row.get("invested", 0)),
-                    "pnl": float(row.get("pnl", 0)),
-                    "pnl_pct": float(row.get("pnl_pct", 0)),
+                    "pnl": pnl_val,
+                    "pnl_pct": pnl_pct_val,
                     "type": str(row.get("type", "CLOSE")),
-                    "tp_price": float(row.get("tp_price", 0)),
-                    "sl_price": float(row.get("sl_price", 0))
+                    "tp_price": float(row.get("tp_price", 0)) if "tp_price" in row else 0.0,
+                    "sl_price": float(row.get("sl_price", 0)) if "sl_price" in row else 0.0
                 })
             return parsed_records
         except Exception as e:
@@ -154,16 +153,9 @@ class GoogleSheetsManager:
             ist_offset = timedelta(hours=5, minutes=30)
             utc_dt = datetime.fromtimestamp(trade_record["timestamp"], tz=timezone.utc)
             ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
-            
             row = [
-                ist_time,
-                trade_record["coin"],
-                trade_record["entry_price"],
-                trade_record["exit_price"],
-                trade_record["invested"],
-                trade_record["pnl"],
-                trade_record["pnl_pct"],
-                trade_record.get("type", "CLOSE")
+                ist_time, trade_record["coin"], trade_record["entry_price"], trade_record["exit_price"],
+                trade_record["invested"], trade_record["pnl"], trade_record["pnl_pct"], trade_record.get("type", "CLOSE")
             ]
             self.trades_sheet.append_row(row)
         except Exception as e:
@@ -176,15 +168,9 @@ class GoogleSheetsManager:
             ist_offset = timedelta(hours=5, minutes=30)
             utc_dt = datetime.fromtimestamp(log_entry["timestamp"], tz=timezone.utc)
             ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
-
             row = [
-                ist_time,
-                log_entry["Action"],
-                log_entry["Coin"],
-                str(log_entry["Quantity"]),
-                str(log_entry["Value (INR)"]),
-                log_entry["Reasoning"],
-                log_entry["Status"]
+                ist_time, log_entry["Action"], log_entry["Coin"], str(log_entry["Quantity"]),
+                str(log_entry["Value (INR)"]), log_entry["Reasoning"], log_entry["Status"]
             ]
             self.logs_sheet.append_row(row)
         except Exception as e:
@@ -197,7 +183,6 @@ class GoogleSheetsManager:
             ist_offset = timedelta(hours=5, minutes=30)
             utc_dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             ist_time = (utc_dt + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
-
             row = [ist_time, str(endpoint), str(error_msg)[:1000]]
             self.errors_sheet.append_row(row)
         except Exception as e:
@@ -209,18 +194,16 @@ def log_api_failure(endpoint, error_msg):
     ts = time.time()
     ist_offset = timedelta(hours=5, minutes=30)
     ist_time = (datetime.fromtimestamp(ts, tz=timezone.utc) + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
-    
     try:
         with open("api-failures.log", "a") as f:
             f.write(f"[{ist_time}] {endpoint} - {error_msg}\n")
     except Exception:
         pass
-        
     if 'gs_manager' in globals():
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. DUAL TIMEFRAME (1H + 15M) PRO ENGINE
+# 3. DUAL TIMEFRAME SPLIT ENGINE (v53)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -234,6 +217,7 @@ class GlobalBotEngine:
         self.is_running = False
         self.trade_log = []
         self.thread = None
+        self.next_scan_epoch = 0 
         
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.auto_top_n = 0 
@@ -241,7 +225,11 @@ class GlobalBotEngine:
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
-        self.candle_interval = "15m"  # Base execution timeframe
+        self.candle_interval = "15m"  
+        
+        # ✨ Exact Tax & Fee Identifiers
+        self.exchange_fee_pct = 0.5 
+        self.tds_pct = 1.0 
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -252,26 +240,27 @@ class GlobalBotEngine:
         
         self.completed_trades = gs_manager.load_trades()
         self.realized_pnl = sum(t.get("pnl", 0.0) for t in self.completed_trades)
-        self.cooldown_counter = 0
+
+    @property
+    def buy_fee_multiplier(self):
+        # 0.5% fee + 18% GST = 0.59% real fee. Cost of buy = Order Value * 1.0059
+        return 1 + (self.exchange_fee_pct / 100.0 * 1.18)
+
+    @property
+    def sell_fee_multiplier(self):
+        # 0.5% fee + 18% GST + 1% TDS. Cash received = Order Value * 0.9841
+        return 1 - (self.exchange_fee_pct / 100.0 * 1.18) - (self.tds_pct / 100.0)
 
     def log_trade(self, action, coin, qty, value, reason, status):
         log_entry = {
-            "timestamp": time.time(),
-            "Action": action,
-            "Coin": coin,
-            "Quantity": qty,
-            "Value (INR)": value,
-            "Reasoning": reason,
-            "Status": status
+            "timestamp": time.time(), "Action": action, "Coin": coin,
+            "Quantity": qty, "Value (INR)": value, "Reasoning": reason, "Status": status
         }
-        
         self.trade_log.insert(0, log_entry)
-        if len(self.trade_log) > 100:
-            self.trade_log.pop()
-            
+        if len(self.trade_log) > 100: self.trade_log.pop()
         gs_manager.append_log(log_entry)
 
-    def start(self, candidate_str, auto_top_n, enable_bear_shield, max_budget, trade_amount, candle_interval):
+    def start(self, candidate_str, auto_top_n, enable_bear_shield, max_budget, trade_amount, exchange_fee_pct, tds_pct, candle_interval):
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
@@ -283,9 +272,10 @@ class GlobalBotEngine:
             self.enable_bear_shield = enable_bear_shield
             self.max_budget = max_budget
             self.trade_amount = trade_amount
+            self.exchange_fee_pct = exchange_fee_pct
+            self.tds_pct = tds_pct
             self.candle_interval = candle_interval
             
-            self.cooldown_counter = 0
             self.is_running = True
             self.thread = threading.Thread(target=self._run_loop, daemon=True)
             self.thread.start()
@@ -293,34 +283,26 @@ class GlobalBotEngine:
     def stop(self):
         self.is_running = False
 
-    def get_seconds_to_next_candle(self):
-        """Calculates exact milliseconds until the 15m candle closes + 1.5s latency buffer."""
+    def get_interval_seconds(self):
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
-        interval_sec = interval_map.get(self.candle_interval, 900)
-        now = time.time()
-        next_candle_time = ((now // interval_sec) + 1) * interval_sec
-        return (next_candle_time - now) + 1.5
+        return interval_map.get(self.candle_interval, 900)
 
     def fetch_candle_data(self, coin, interval=None, limit=40):
         market_name = f"{coin}INR"
         pair = self.market_pair_string.get(market_name, f"B-{coin}_INR")
         actual_interval = interval or self.candle_interval
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={actual_interval}&limit={limit}"
-        
         try:
             res = requests.get(url, timeout=10)
             res.raise_for_status()
             data = res.json()
-            if isinstance(data, list) and len(data) >= 20:
-                return data
-            else:
-                log_api_failure(url, f"Unexpected format or insufficient candles: {data}")
+            if isinstance(data, list) and len(data) >= 20: return data
+            else: log_api_failure(url, f"Unexpected format or insufficient candles: {data}")
         except Exception as e:
             log_api_failure(url, str(e))
         return None
 
     def process_df_indicators(self, candles_data):
-        """Processes OHLCV candles into a clean Pandas DataFrame with technical indicators."""
         df = pd.DataFrame(candles_data)
         df['open'] = df['open'].astype(float)
         df['high'] = df['high'].astype(float)
@@ -328,7 +310,6 @@ class GlobalBotEngine:
         df['close'] = df['close'].astype(float)
         df = df.sort_values(by='time', ascending=True)
 
-        # ATR (14)
         df['prev_close'] = df['close'].shift(1)
         df['tr1'] = df['high'] - df['low']
         df['tr2'] = (df['high'] - df['prev_close']).abs()
@@ -336,7 +317,6 @@ class GlobalBotEngine:
         df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
         df['ATR'] = df['tr'].rolling(window=14).mean()
 
-        # RSI (14)
         delta = df['close'].diff()
         gain = delta.clip(lower=0)
         loss = -1 * delta.clip(upper=0)
@@ -345,23 +325,35 @@ class GlobalBotEngine:
         rs = avg_gain / avg_loss
         df['RSI'] = 100 - (100 / (1 + rs))
 
-        # MACD
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp1 - exp2
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['MACD_Hist'] = df['MACD'] - df['Signal']
 
-        # Bollinger Bands (20, 2)
         df['SMA_20'] = df['close'].rolling(window=20).mean()
         df['STD_20'] = df['close'].rolling(window=20).std()
         df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
         df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
         
-        # 50 EMA for Trend
         df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
-
         return df
+
+    def check_htf_trend(self, coin):
+        candles = self.fetch_candle_data(coin, interval="1h", limit=250)
+        time.sleep(0.4) 
+        if candles and len(candles) >= 200:
+            try:
+                df = pd.DataFrame(candles)
+                df['close'] = df['close'].astype(float)
+                df = df.sort_values(by='time', ascending=True)
+                df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
+                latest_close = df['close'].iloc[-1]
+                latest_ema = df['EMA_200'].iloc[-1]
+                return latest_close > latest_ema 
+            except Exception as e:
+                log_api_failure("check_htf_trend (Pandas Error)", str(e))
+        return True 
 
     def check_market_regime(self):
         candles = self.fetch_candle_data("BTC", limit=60)
@@ -371,44 +363,50 @@ class GlobalBotEngine:
                 df['close'] = df['close'].astype(float)
                 df = df.sort_values(by='time', ascending=True)
                 df['SMA_50'] = df['close'].rolling(window=50).mean()
-                
                 latest_close = df['close'].iloc[-1]
                 latest_sma50 = df['SMA_50'].iloc[-1]
-                
-                if latest_close < latest_sma50:
-                    return "BEARISH"
-                else:
-                    return "BULLISH"
+                if latest_close < latest_sma50: return "BEARISH"
+                else: return "BULLISH"
             except Exception as e:
                 log_api_failure("check_market_regime (Pandas Error)", str(e))
         return "NEUTRAL"
 
     def _run_loop(self):
+        last_candle_block = 0
         while self.is_running:
             try:
-                self._execute_cycle()
-            except Exception as e:
-                self.log_trade("ERROR", "SYSTEM", "0", "₹0.00", f"Cycle Crash: {str(e)}", "Failed")
-            
-            if not self.is_running: break
-            sleep_seconds = self.get_seconds_to_next_candle()
-            
-            while sleep_seconds > 0 and self.is_running:
-                time.sleep(1)
-                sleep_seconds -= 1
+                self._fetch_market_state()
+                self._monitor_live_exits()
+                
+                interval_sec = self.get_interval_seconds()
+                now = time.time()
+                current_block = int(now) // interval_sec
+                next_close = (current_block + 1) * interval_sec
+                
+                self.next_scan_epoch = next_close + 1.5
+                
+                if current_block > last_candle_block:
+                    time.sleep(1.5) 
+                    self._scan_for_entries()
+                    last_candle_block = current_block
 
-    def _execute_cycle(self):
+            except Exception as e:
+                self.log_trade("ERROR", "SYSTEM", "0", "₹0.00", f"Engine Crash: {str(e)}", "Failed")
+            
+            for _ in range(10):
+                if not self.is_running: break
+                time.sleep(1)
+
+    def _fetch_market_state(self):
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
-        
         actual_balances = {}
         if isinstance(balances_data, list):
             for b in balances_data:
                 bal = float(b.get('balance', 0))
                 if bal > 0:
                     actual_balances[b['currency']] = bal
-                    if b['currency'] == 'INR':
-                        self.inr_balance = bal
+                    if b['currency'] == 'INR': self.inr_balance = bal
 
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=10)
@@ -435,19 +433,14 @@ class GlobalBotEngine:
                                 vol = float(t.get('volume', 0))
                                 price = float(t.get('last_price', 0))
                                 inr_markets.append((base_coin, vol * price))
-                            except Exception:
-                                pass
-                
+                            except Exception: pass
                 inr_markets.sort(key=lambda x: x[1], reverse=True)
                 self.candidates = [m[0] for m in inr_markets[:self.auto_top_n]]
                 self.log_trade("SYSTEM", "AUTO-SCAN", str(self.auto_top_n), "₹0.00", f"Auto-selected top {self.auto_top_n} volatile coins by 24h volume.", "Info")
-
         except Exception as e:
             log_api_failure("markets_details or ticker", str(e))
-            self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API. Retrying next cycle.", "API Pause")
             return
 
-        # 1. Sync Holdings
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -455,85 +448,105 @@ class GlobalBotEngine:
                 if curr_price:
                     value = actual_balances[coin] * curr_price
                     if value > 50:
+                        # Legacy sync - applies true invested value math instantly
+                        invested_with_fees = value * self.buy_fee_multiplier
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
-                            "invested": value,
+                            "invested": invested_with_fees,
                             "tp_price": curr_price * 1.05, 
                             "sl_price": curr_price * 0.95
                         }
-                        self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{value:.2f}", "Detected external wallet asset.", "Wallet Sync")
+                        self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{invested_with_fees:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
         for coin in list(self.active_positions.keys()):
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
                 del self.active_positions[coin]
 
-        # 2. Bear Shield Check
+    def _monitor_live_exits(self):
         if self.enable_bear_shield:
             market_state = self.check_market_regime()
-            time.sleep(0.5) 
             if market_state == "BEARISH":
                 for coin in list(self.active_positions.keys()):
-                    market = f"{coin}INR"
-                    curr_price = self.last_prices.get(market, 0)
-                    pos = self.active_positions[coin]
-                    
-                    precision = self.market_precision.get(market, 5)
-                    multiplier = 10 ** precision
-                    sell_qty = math.floor(actual_balances.get(coin, 0) * multiplier) / multiplier
-                    actual_value = sell_qty * curr_price
-                    
-                    if actual_value >= 100.0:
-                        formatted_qty = f"{sell_qty:.{precision}f}"
-                        order_body = {
-                            "side": "sell",
-                            "order_type": "limit_order",
-                            "market": market,
-                            "price_per_unit": float(curr_price),
-                            "total_quantity": float(formatted_qty), 
-                            "timestamp": int(round(time.time() * 1000))
-                        }
-                        res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
-                        if "orders" in res or "id" in res:
-                            profit_inr = actual_value - pos['invested']
-                            pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
-                            self.realized_pnl += profit_inr
-                            
-                            trade_record = {
-                                "timestamp": time.time(),
-                                "coin": coin,
-                                "entry_price": pos['entry_price'],
-                                "exit_price": curr_price,
-                                "invested": pos['invested'],
-                                "pnl": profit_inr,
-                                "pnl_pct": pnl_pct,
-                                "type": "BEAR LIQUIDATE"
-                            }
-                            self.completed_trades.append(trade_record)
-                            gs_manager.append_trade(trade_record)
-                            
-                            self.log_trade("BEAR SELL", coin, formatted_qty, f"₹{actual_value:.2f}", "Bear Shield Activated: Liquidated to cash (INR).", "Success")
-                            del self.active_positions[coin]
-
-                self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active; pausing new buys.", "Shield Active")
+                    self._execute_sell(coin, "BEAR LIQUIDATE", "Bear Shield Activated: Liquidated to cash (INR).")
+                self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active.", "Shield Active")
                 return 
 
-        # 3. Manage Active Positions (Exits)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
             if not curr_price: continue
             
             pos = self.active_positions[coin]
-            pnl_pct = ((curr_price - pos['entry_price']) / pos['entry_price']) * 100
-            curr_val = pos['qty'] * curr_price
             
-            ai_sell_signal = False
-            ai_reason = ""
+            # True Net Calculation for live TP/SL checking
+            net_received = (pos['qty'] * curr_price) * self.sell_fee_multiplier
+            net_profit = net_received - pos['invested']
+            net_pnl_pct = (net_profit / pos['invested']) * 100
+            
+            is_tp = curr_price >= pos.get('tp_price', float('inf'))
+            is_sl = curr_price <= pos.get('sl_price', 0.0)
+            
+            if is_tp:
+                self._execute_sell(coin, "TAKE PROFIT", f"ATR Target Hit (+{net_pnl_pct:.2f}% Net).")
+            elif is_sl:
+                self._execute_sell(coin, "STOP LOSS", f"ATR Stop Hit ({net_pnl_pct:.2f}% Net).")
+
+    def _execute_sell(self, coin, action_type, reasoning):
+        pos = self.active_positions[coin]
+        market = f"{coin}INR"
+        curr_price = self.last_prices.get(market, pos['entry_price'])
+        
+        precision = self.market_precision.get(market, 5)
+        multiplier = 10 ** precision
+        sell_qty = math.floor(pos['qty'] * multiplier) / multiplier
+        
+        gross_value = sell_qty * curr_price
+        
+        if gross_value >= 100.0:
+            formatted_qty = f"{sell_qty:.{precision}f}"
+            order_body = {
+                "side": "sell", "order_type": "limit_order", "market": market,
+                "price_per_unit": float(curr_price), "total_quantity": float(formatted_qty), 
+                "timestamp": int(round(time.time() * 1000))
+            }
+            res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
+            if "orders" in res or "id" in res:
+                
+                # ✨ Exact Net Post-Tax Math
+                net_received = gross_value * self.sell_fee_multiplier
+                net_profit = net_received - pos['invested']
+                net_pnl_pct = (net_profit / pos['invested']) * 100
+                
+                self.realized_pnl += net_profit
+                
+                trade_record = {
+                    "timestamp": time.time(), "coin": coin, "entry_price": pos['entry_price'], "exit_price": curr_price,
+                    "invested": pos['invested'], "pnl": net_profit, "pnl_pct": net_pnl_pct, "type": action_type
+                }
+                self.completed_trades.append(trade_record)
+                gs_manager.append_trade(trade_record)
+                
+                self.log_trade("SELL", coin, formatted_qty, f"₹{net_received:.2f}", reasoning, "Success")
+                del self.active_positions[coin]
+            else:
+                err = res.get("error", "API Error")
+                self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
+
+    def _scan_for_entries(self):
+        for coin in list(self.active_positions.keys()):
+            market = f"{coin}INR"
+            curr_price = self.last_prices.get(market)
+            if not curr_price: continue
+            
+            pos = self.active_positions[coin]
+            
+            # ✨ NEW: Breakeven Math for the AI Dead Zone
+            breakeven_price = pos['entry_price'] * (self.buy_fee_multiplier / self.sell_fee_multiplier)
             
             candles_15m = self.fetch_candle_data(coin, interval="15m")
-            time.sleep(0.5) 
+            time.sleep(0.4) 
             
             if candles_15m:
                 try:
@@ -545,87 +558,28 @@ class GlobalBotEngine:
                         df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
                         
                         client = Groq(api_key=GROQ_API_KEY)
-                        sell_prompt = """You are an elite quantitative crypto hedge fund manager.
-                        Analyze the raw candlestick data (OHLC), RSI, MACD Histogram, and Upper Bollinger Band.
-                        Determine if the coin has reached a local peak or momentum is exhausting.
-                        - Output 'SELL' if price is overextended near/above Upper_BB and candle wicks/MACD show slowing buyer momentum.
-                        - Output 'HOLD' if the trend remains strong upwards.
-                        Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short concise sentence"}"""
+                        sell_prompt = """You are an elite quantitative crypto hedge fund manager. Analyze the raw candlestick data. Determine if the coin has reached a local peak or momentum is exhausting. Output 'SELL' if price is overextended near/above Upper_BB and candle wicks/MACD show slowing buyer momentum. Output 'HOLD' if the trend remains strong upwards. Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short sentence"}"""
                         
                         response = client.chat.completions.create(
-                            model="llama-3.3-70b-versatile", # ✨ UPDATED TO LLAMA 3.3 70B
+                            model="llama-3.3-70b-versatile", 
                             messages=[
                                 {"role": "system", "content": sell_prompt},
                                 {"role": "user", "content": f"Held asset {market} (15m candles):\n\n{df_str}"}
                             ],
-                            response_format={"type": "json_object"},
-                            temperature=0.1
+                            response_format={"type": "json_object"}, temperature=0.1
                         )
                         decision_data = json.loads(response.choices[0].message.content)
                         if decision_data.get("action", "").upper() == "SELL":
-                            ai_sell_signal = True
-                            ai_reason = decision_data.get("reasoning", "AI detected peak exhaustion.")
-                        else:
-                            self.log_trade("AI HOLD", coin, f"{pos['qty']:.4f}", f"₹{curr_val:.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
+                            
+                            # ✨ THE AI DEAD ZONE BLOCKER
+                            if pos['entry_price'] < curr_price < breakeven_price:
+                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Gross profit is in the Dead Zone and cannot clear the 2.18% TDS/Fee hurdle.", "Tax Shield")
+                            else:
+                                self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
                 except Exception as e:
                     log_api_failure("groq_chat_completion_sell", str(e))
 
-            is_tp = curr_price >= pos.get('tp_price', float('inf'))
-            is_sl = curr_price <= pos.get('sl_price', 0.0)
-            
-            if is_tp or is_sl or ai_sell_signal:
-                if is_tp: action_type, reasoning = "TAKE PROFIT", f"ATR Target Hit (+{pnl_pct:.2f}%)."
-                elif is_sl: action_type, reasoning = "STOP LOSS", f"ATR Stop Hit ({pnl_pct:.2f}%)."
-                else: action_type, reasoning = "PRO AI SELL", ai_reason
-                
-                precision = self.market_precision.get(market, 5)
-                multiplier = 10 ** precision
-                sell_qty = math.floor(actual_balances.get(coin, 0) * multiplier) / multiplier
-                actual_value = sell_qty * curr_price
-                
-                if actual_value >= 100.0:
-                    formatted_qty = f"{sell_qty:.{precision}f}"
-                    order_body = {
-                        "side": "sell",
-                        "order_type": "limit_order",
-                        "market": market,
-                        "price_per_unit": float(curr_price),
-                        "total_quantity": float(formatted_qty), 
-                        "timestamp": int(round(time.time() * 1000))
-                    }
-                    res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
-                    if "orders" in res or "id" in res:
-                        profit_inr = actual_value - pos['invested']
-                        self.realized_pnl += profit_inr
-                        
-                        trade_record = {
-                            "timestamp": time.time(),
-                            "coin": coin,
-                            "entry_price": pos['entry_price'],
-                            "exit_price": curr_price,
-                            "invested": pos['invested'],
-                            "pnl": profit_inr,
-                            "pnl_pct": pnl_pct,
-                            "type": action_type
-                        }
-                        self.completed_trades.append(trade_record)
-                        gs_manager.append_trade(trade_record)
-                        
-                        self.log_trade("SELL", coin, formatted_qty, f"₹{actual_value:.2f}", reasoning, "Success")
-                        del self.active_positions[coin]
-                        self.cooldown_counter = 2
-                        return
-                    else:
-                        err = res.get("error", "API Error")
-                        self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{actual_value:.2f}", f"Rejected: {err}", "Error")
-
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            return
-
-        # 4. MULTI-TIMEFRAME SCANNER (1H + 15M)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
-        
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
             best_candidate_market = None
@@ -634,7 +588,6 @@ class GlobalBotEngine:
             best_candidate_15m_str = ""
             best_setup_score = -999.0
             best_atr = 0.0
-            scan_success_count = 0
 
             for coin in self.candidates:
                 if coin in self.active_positions: continue
@@ -643,7 +596,8 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                # Fetch BOTH 1-Hour and 15-Minute Candle Data
+                if not self.check_htf_trend(coin): continue
+                
                 candles_1h = self.fetch_candle_data(coin, interval="1h", limit=60)
                 time.sleep(0.4)
                 candles_15m = self.fetch_candle_data(coin, interval="15m", limit=40)
@@ -651,12 +605,10 @@ class GlobalBotEngine:
                 
                 if candles_1h and candles_15m:
                     try:
-                        # Process 1-Hour HTF DataFrame
                         df_1h = self.process_df_indicators(candles_1h)
                         df_1h['time'] = pd.to_datetime(df_1h['time'], unit='ms')
                         df_1h_str = df_1h[['time', 'open', 'high', 'low', 'close', 'RSI', 'EMA_50', 'MACD_Hist']].tail(6).to_string(index=False)
                         
-                        # Process 15-Minute LTF DataFrame
                         df_15m = self.process_df_indicators(candles_15m)
                         df_15m['time'] = pd.to_datetime(df_15m['time'], unit='ms')
                         df_15m_str = df_15m[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ATR']].tail(8).to_string(index=False)
@@ -665,8 +617,6 @@ class GlobalBotEngine:
                         latest_close_15m = df_15m['close'].iloc[-1]
                         lower_bb_15m = df_15m['Lower_BB'].iloc[-1]
                         latest_atr_15m = df_15m['ATR'].iloc[-1]
-                        
-                        scan_success_count += 1
                         
                         bb_distance_pct = ((latest_close_15m - lower_bb_15m) / lower_bb_15m) * 100
                         setup_score = (100.0 - latest_rsi_15m) - (bb_distance_pct * 2)
@@ -683,42 +633,25 @@ class GlobalBotEngine:
                         log_api_failure(f"MTF calculation ({coin})", str(e))
                         continue
 
-            if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
-                self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX endpoints temporary delay. Retrying next cycle.", "API Pause")
-                return
-
             if best_candidate_coin and best_candidate_1h_str and best_candidate_15m_str:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are an elite quantitative crypto hedge fund manager specializing in Multi-Timeframe (MTF) market structure analysis.
-                Your job is to analyze BOTH the 1-Hour (Macro Trend) and 15-Minute (Trigger Entry) charts before issuing a decision.
-                
+                system_prompt = """You are an elite quantitative crypto hedge fund manager specializing in Multi-Timeframe (MTF) market structure analysis. Your job is to analyze BOTH the 1-Hour (Macro Trend) and 15-Minute (Trigger Entry) charts before issuing a decision.
                 Evaluation Rules:
                 1. 1-Hour Macro Filter: Ensure the 1-Hour price is holding key support or aligned with positive MACD/EMA momentum. Reject if 1-Hour is breaking down hard.
                 2. 15-Minute Trigger: Look for bullish bounce setups (low rejection wicks, holding near/above Lower Bollinger Band, RSI oversold recovery).
                 3. Confluence Requirement: Only output 'BUY' if BOTH timeframes agree.
+                Respond ONLY in JSON format: {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the MTF alignment"}"""
                 
-                Respond ONLY in JSON format:
-                {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the MTF alignment"}"
-                """
-                
-                mtf_user_prompt = f"""Analyze Multi-Timeframe data for candidate {best_candidate_market}:
-
-=== 1-HOUR CHART (MACRO TREND & CONTEXT) ===
-{best_candidate_1h_str}
-
-=== 15-MINUTE CHART (PRECISION ENTRY TRIGGER) ===
-{best_candidate_15m_str}
-"""
+                mtf_user_prompt = f"Analyze Multi-Timeframe data for candidate {best_candidate_market}:\n=== 1-HOUR CHART ===\n{best_candidate_1h_str}\n=== 15-MINUTE CHART ===\n{best_candidate_15m_str}"
                 
                 try:
                     response = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile", # ✨ UPDATED TO LLAMA 3.3 70B
+                        model="llama-3.3-70b-versatile",
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": mtf_user_prompt}
                         ],
-                        response_format={"type": "json_object"},
-                        temperature=0.1
+                        response_format={"type": "json_object"}, temperature=0.1
                     )
                     decision_data = json.loads(response.choices[0].message.content)
                     action = decision_data.get("action", "HOLD").upper()
@@ -730,46 +663,47 @@ class GlobalBotEngine:
                         raw_crypto = self.trade_amount / best_candidate_price
                         
                         buy_crypto_amount = math.ceil(raw_crypto * multiplier) / multiplier
-                        
                         min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
-                        if buy_crypto_amount < min_required_qty:
-                            buy_crypto_amount = min_required_qty
+                        if buy_crypto_amount < min_required_qty: buy_crypto_amount = min_required_qty
                             
                         actual_cost = buy_crypto_amount * best_candidate_price
-                        
                         if actual_cost < 105.0:
                             required_for_105 = 105.0 / best_candidate_price
                             buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
                             actual_cost = buy_crypto_amount * best_candidate_price
+                            
+                        # True Invested Amount Includes the 0.59% Buy Fee Deduction
+                        total_invested_with_fees = actual_cost * self.buy_fee_multiplier
 
-                        if actual_cost > (self.trade_amount + 15.0):
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", f"Exchange min qty requires ₹{actual_cost:.2f}, exceeding your limit.", "Limit Enforced")
-                        elif actual_cost > self.inr_balance:
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{actual_cost:.2f}", "Insufficient INR Balance.", "Failed")
+                        if total_invested_with_fees > (self.trade_amount + 15.0):
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Exchange min qty requires ₹{total_invested_with_fees:.2f}, exceeding your limit.", "Limit Enforced")
+                        elif total_invested_with_fees > self.inr_balance:
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient INR Balance.", "Failed")
                         else:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                             order_body = {
-                                "side": "buy",
-                                "order_type": "limit_order",
-                                "market": best_candidate_market,
-                                "price_per_unit": float(best_candidate_price),
-                                "total_quantity": float(formatted_qty), 
+                                "side": "buy", "order_type": "limit_order", "market": best_candidate_market,
+                                "price_per_unit": float(best_candidate_price), "total_quantity": float(formatted_qty), 
                                 "timestamp": int(round(time.time() * 1000))
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
+                                
+                                # ✨ NEW: Minimum Net Profit Guarantee
+                                breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
+                                min_net_profit_tp = breakeven_price * 1.005 # Forces an absolute minimum of +0.5% Net Profit
+                                
                                 target_tp = best_candidate_price + (3.0 * best_atr)
+                                if target_tp < min_net_profit_tp:
+                                    target_tp = min_net_profit_tp
+                                    
                                 target_sl = best_candidate_price - (1.5 * best_atr)
                                 
                                 self.active_positions[best_candidate_coin] = {
-                                    "qty": buy_crypto_amount,
-                                    "entry_price": best_candidate_price,
-                                    "invested": actual_cost,
-                                    "tp_price": target_tp,
-                                    "sl_price": target_sl
+                                    "qty": buy_crypto_amount, "entry_price": best_candidate_price,
+                                    "invested": total_invested_with_fees, "tp_price": target_tp, "sl_price": target_sl
                                 }
-                                self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", reasoning, "Success")
-                                self.cooldown_counter = 2
+                                self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
                             else:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
@@ -778,24 +712,18 @@ class GlobalBotEngine:
                 except Exception as e:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
-        else:
-            self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v50
+# Cache Buster v53
 @st.cache_resource
-def get_bot_engine_v50():
+def get_bot_engine_v53():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v50()
+bot = get_bot_engine_v53()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
 # ==========================================
-st.set_page_config(
-    page_title="AI Portfolio Manager", 
-    page_icon="🏦", 
-    layout="wide"
-)
+st.set_page_config(page_title="AI Portfolio Manager", page_icon="🏦", layout="wide")
 
 def inject_custom_css():
     st.markdown("""
@@ -803,16 +731,7 @@ def inject_custom_css():
         .stApp { background-color: #f8f9fa; color: #202124; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
         .block-container { padding-top: 2rem !important; }
         [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #e0e0e0; }
-        
-        .metric-card {
-            background: #ffffff;
-            border: 1px solid #eaebed;
-            border-radius: 12px;
-            padding: 20px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-            margin-bottom: 12px;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
+        .metric-card { background: #ffffff; border: 1px solid #eaebed; border-radius: 12px; padding: 20px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04); margin-bottom: 12px; transition: transform 0.2s ease, box-shadow 0.2s ease; }
         .metric-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0, 0, 0, 0.08); border-color: #1a73e8; }
         .metric-title { font-size: 0.85rem; color: #5f6368; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; margin-bottom: 8px; }
         .metric-value { font-size: 1.8rem; font-weight: 700; color: #202124; }
@@ -821,17 +740,12 @@ def inject_custom_css():
         .text-red { color: #d23f31 !important; }
         .text-blue { color: #1a73e8 !important; }
         .stProgress > div > div > div > div { background-color: #1a73e8; }
-        
         .settings-box { background: #ffffff; border: 1px solid #eaebed; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); margin-bottom: 24px; }
-        
         .stTabs [data-baseweb="tab-list"] { background-color: transparent; border-bottom: 1px solid #e0e0e0; gap: 16px; }
         .stTabs [data-baseweb="tab"] { height: 48px; font-weight: 600; color: #5f6368; }
         .stTabs [aria-selected="true"] { color: #1a73e8 !important; border-bottom-color: #1a73e8 !important; }
-        
-        @media (max-width: 768px) { .metric-value { font-size: 1.4rem; } .metric-card { padding: 16px; } }
     </style>
     """, unsafe_allow_html=True)
-
 inject_custom_css()
 
 # ==========================================
@@ -849,7 +763,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 50.0 (Llama 3.3 70B Integration)")
+st.sidebar.caption("Version 53.0 (Exact Tax & Fee Accounting)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -872,8 +786,7 @@ if page == "⚙️ Bot Engine & Settings":
         else:
             top_n = st.number_input(
                 "Top Coins Limit (By Volume)", 
-                min_value=1, 
-                max_value=20, 
+                min_value=1, max_value=20, 
                 value=5 if bot.auto_top_n == 0 else bot.auto_top_n,
                 help="Automatically scans CoinDCX for the highest 24-hour volume INR pairs (excluding stablecoins)."
             )
@@ -884,31 +797,31 @@ if page == "⚙️ Bot Engine & Settings":
         default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 1
         candle_interval = st.selectbox(
             "Candle Timeframe (Trigger Execution)", 
-            timeframes, 
-            index=default_idx
+            timeframes, index=default_idx
         )
     
     enable_bear_shield = st.checkbox(
         "🛡️ Enable Macro Market Bear Shield (BTC 50-SMA)", 
-        value=bool(bot.enable_bear_shield),
-        help="Liquidates open positions to cash (INR) and pauses new buys when Bitcoin drops below 50-SMA."
+        value=bool(bot.enable_bear_shield)
     )
 
-    st.markdown("<br>#### 💰 Capital & Risk Management", unsafe_allow_html=True)
-    colA, colB = st.columns(2)
+    st.markdown("<br>#### 💰 Capital & Tax Shield Settings", unsafe_allow_html=True)
+    colA, colB, colC = st.columns(3)
     with colA:
         max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
     with colB:
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
+    with colC:
+        exchange_fee_pct = st.number_input("Exchange Fee % (e.g. 0.5)", min_value=0.0, value=float(bot.exchange_fee_pct), step=0.1)
+        tds_pct = st.number_input("Govt TDS % (e.g. 1.0)", min_value=0.0, value=float(bot.tds_pct), step=0.1)
         
-    st.info("🧠 **Dual Timeframe AI Analysis:** The Groq Llama 3.3 70B model now evaluates both **1-Hour** (Macro Trend) and **15-Minute** (Precision Entry) charts simultaneously before authorizing any trade.", icon="📊")
-    st.info(f"⏱️ **Clock-Locking Active:** Timer is locked to trigger exactly on **{candle_interval}** candle closes (+1.5s latency buffer).", icon="🔒")
+    st.info(f"🛡️ **Tax Shield Active:** The bot automatically factors in {exchange_fee_pct}% Maker/Taker fees + 18% GST + {tds_pct}% TDS. It calculates absolute exact net cash-in-hand and explicitly prevents taking profits if the margin lands in the Tax Dead Zone.", icon="🇮🇳")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(candidate_input, top_n, enable_bear_shield, max_bud, trade_amt, candle_interval)
+            bot.start(candidate_input, top_n, enable_bear_shield, max_bud, trade_amt, exchange_fee_pct, tds_pct, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -921,27 +834,20 @@ if page == "⚙️ Bot Engine & Settings":
 
     st.markdown("---")
     
-    st.subheader("☁️ Cloud Storage Connection Status")
-    is_connected = gs_manager.connect()
-    
-    if is_connected:
-        st.success(f"✅ Connected to Google Sheet (`{SHEET_NAME}`)! Tracking Trades, Logs, and API Errors.")
-    else:
-        st.error(f"❌ Google Sheets Connection Failed: **{gs_manager.last_error}**")
-
-    st.markdown("---")
-
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            shield_status = "Shield Enabled" if bot.enable_bear_shield else "Shield Disabled"
-            
-            if bot.auto_top_n > 0 and len(bot.candidates) == 0:
-                asset_str = f"Auto-Scanning Top {bot.auto_top_n} Coins..."
+            if bot.next_scan_epoch > 0:
+                time_left = max(0, int(bot.next_scan_epoch - time.time()))
+                m, s = divmod(time_left, 60)
+                timer_str = f" | ⏳ Next AI Entry Scan in: {m:02d}:{s:02d}"
             else:
-                asset_str = f"{len(bot.candidates)} core assets ({', '.join(bot.candidates)})"
+                timer_str = " | ⏳ Aggregating Data..."
                 
-            st.info(f"⚡ **System Active:** Monitoring {asset_str} on {bot.candle_interval} + 1H MTF | Bear Shield: {shield_status}")
+            shield_status = "Shield Enabled" if bot.enable_bear_shield else "Shield Disabled"
+            asset_str = f"Auto-Scanning Top {bot.auto_top_n} Coins" if bot.auto_top_n > 0 and len(bot.candidates) == 0 else f"{len(bot.candidates)} assets ({', '.join(bot.candidates)})"
+            
+            st.info(f"⚡ **System Active:** High-Frequency Exit Monitor LIVE. {asset_str} {timer_str}")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
@@ -988,8 +894,7 @@ elif page == "📊 Live Dashboard":
             tickers = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10).json()
             if isinstance(tickers, list):
                 for t in tickers:
-                    if 'market' in t:
-                        live_prices[t['market']] = float(t['last_price'])
+                    if 'market' in t: live_prices[t['market']] = float(t['last_price'])
         except Exception as e:
             log_api_failure("Dashboard Balance/Ticker Fetch", str(e))
         
@@ -1001,12 +906,8 @@ elif page == "📊 Live Dashboard":
         current_year = now_ist.year
         current_month = now_ist.month
         
-        if current_month == 1:
-            last_month_year = current_year - 1
-            last_month_num = 12
-        else:
-            last_month_year = current_year
-            last_month_num = current_month - 1
+        last_month_year = current_year - 1 if current_month == 1 else current_year
+        last_month_num = 12 if current_month == 1 else current_month - 1
 
         two_years_ago = now_ist - timedelta(days=730)
 
@@ -1021,43 +922,47 @@ elif page == "📊 Live Dashboard":
         for trade in bot.completed_trades:
             trade_dt_ist = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset
             trade_date = trade_dt_ist.date()
-            pnl = trade.get("pnl", 0.0)
+            
+            # ✨ NET PnL extracted automatically from v53+ trades
+            net_pnl = float(trade.get("pnl", 0.0))
 
             if trade_dt_ist >= two_years_ago:
-                if pnl >= 0: period_stats["all_time"]["profit"] += pnl
-                else: period_stats["all_time"]["loss"] += abs(pnl)
+                if net_pnl >= 0: period_stats["all_time"]["profit"] += net_pnl
+                else: period_stats["all_time"]["loss"] += abs(net_pnl)
                 period_stats["all_time"]["count"] += 1
 
                 if trade_date == today_date_ist:
-                    if pnl >= 0: period_stats["today"]["profit"] += pnl
-                    else: period_stats["today"]["loss"] += abs(pnl)
+                    if net_pnl >= 0: period_stats["today"]["profit"] += net_pnl
+                    else: period_stats["today"]["loss"] += abs(net_pnl)
                     period_stats["today"]["count"] += 1
 
                 if trade_date == yesterday_date_ist:
-                    if pnl >= 0: period_stats["yesterday"]["profit"] += pnl
-                    else: period_stats["yesterday"]["loss"] += abs(pnl)
+                    if net_pnl >= 0: period_stats["yesterday"]["profit"] += net_pnl
+                    else: period_stats["yesterday"]["loss"] += abs(net_pnl)
                     period_stats["yesterday"]["count"] += 1
 
                 if trade_dt_ist.year == current_year and trade_dt_ist.month == current_month:
-                    if pnl >= 0: period_stats["this_month"]["profit"] += pnl
-                    else: period_stats["this_month"]["loss"] += abs(pnl)
+                    if net_pnl >= 0: period_stats["this_month"]["profit"] += net_pnl
+                    else: period_stats["this_month"]["loss"] += abs(net_pnl)
                     period_stats["this_month"]["count"] += 1
 
                 if trade_dt_ist.year == last_month_year and trade_dt_ist.month == last_month_num:
-                    if pnl >= 0: period_stats["last_month"]["profit"] += pnl
-                    else: period_stats["last_month"]["loss"] += abs(pnl)
+                    if net_pnl >= 0: period_stats["last_month"]["profit"] += net_pnl
+                    else: period_stats["last_month"]["loss"] += abs(net_pnl)
                     period_stats["last_month"]["count"] += 1
 
         current_invested = sum(p['invested'] for p in bot.active_positions.values())
-        unrealized_pnl = 0.0
+        unrealized_net_pnl = 0.0
+        
         for coin, pos in bot.active_positions.items():
             live_p = live_prices.get(f"{coin}INR", pos['entry_price'])
-            unrealized_pnl += (pos['qty'] * live_p) - pos['invested']
+            # Live Exact Net Calculation
+            net_live_value = (pos['qty'] * live_p) * bot.sell_fee_multiplier
+            unrealized_net_pnl += (net_live_value - pos['invested'])
 
         budget_pct = min(1.0, current_invested / bot.max_budget) if bot.max_budget > 0 else 0.0
 
         m_col1, m_col2, m_col3 = st.columns(3)
-        
         with m_col1:
             st.markdown(f"""
                 <div class="metric-card">
@@ -1070,7 +975,7 @@ elif page == "📊 Live Dashboard":
         with m_col2:
             st.markdown(f"""
                 <div class="metric-card">
-                    <div class="metric-title">Budget Utilized</div>
+                    <div class="metric-title">Budget Utilized (With Fees)</div>
                     <div class="metric-value">₹{current_invested:,.2f}</div>
                     <div class="metric-sub">Max Allocation Limit: ₹{bot.max_budget:,.2f}</div>
                     <div style="margin-top: 8px;"></div>
@@ -1079,30 +984,26 @@ elif page == "📊 Live Dashboard":
             st.progress(budget_pct)
             
         with m_col3:
-            pnl_color = "text-green" if unrealized_pnl >= 0 else "text-red"
-            pnl_pct_str = f"{(unrealized_pnl/current_invested*100):.2f}%" if current_invested else "0.00%"
+            pnl_color = "text-green" if unrealized_net_pnl >= 0 else "text-red"
+            pnl_pct_str = f"{(unrealized_net_pnl/current_invested*100):.2f}%" if current_invested else "0.00%"
             st.markdown(f"""
                 <div class="metric-card">
-                    <div class="metric-title">Floating P&L</div>
-                    <div class="metric-value {pnl_color}">₹{unrealized_pnl:,.2f}</div>
-                    <div class="metric-sub {pnl_color}">{pnl_pct_str} Total Unsold Return</div>
+                    <div class="metric-title">True Floating P&L (Net of Tax)</div>
+                    <div class="metric-value {pnl_color}">₹{unrealized_net_pnl:,.2f}</div>
+                    <div class="metric-sub {pnl_color}">{pnl_pct_str} Total Unsold Net Return</div>
                 </div>
             """, unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-
-        st.subheader("📈 Performance History")
-        
-        tab_today, tab_yesterday, tab_this_m, tab_last_m, tab_all = st.tabs([
-            "Today", "Yesterday", "This Month", "Last Month", "All-Time"
-        ])
+        st.subheader("📈 NET Performance History (Post-TDS & Fees)")
+        tab_today, tab_yesterday, tab_this_m, tab_last_m, tab_all = st.tabs(["Today", "Yesterday", "This Month", "Last Month", "All-Time"])
 
         def render_period_metrics(p_data):
             net = p_data["profit"] - p_data["loss"]
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Gross Profit", f"₹{p_data['profit']:,.2f}")
-            c2.metric("Gross Loss", f"₹{p_data['loss']:,.2f}")
-            c3.metric("Net Return", f"₹{net:,.2f}", delta=f"₹{net:,.2f}")
+            c1.metric("Net Winning Trades", f"₹{p_data['profit']:,.2f}")
+            c2.metric("Net Losing Trades", f"₹{p_data['loss']:,.2f}")
+            c3.metric("Total Net Return", f"₹{net:,.2f}", delta=f"₹{net:,.2f}")
             c4.metric("Trades Executed", f"{p_data['count']}")
 
         with tab_today: render_period_metrics(period_stats["today"])
@@ -1112,31 +1013,32 @@ elif page == "📊 Live Dashboard":
         with tab_all: render_period_metrics(period_stats["all_time"])
 
         st.markdown("<br>", unsafe_allow_html=True)
-
         st.subheader("💼 Active Holdings")
+        
         if not bot.active_positions:
-            st.info("No active positions held. Bot is scanning candidates for precision bounce setups.")
+            st.info("No active positions held. The bot will scan for precision setups when the current candle closes.")
         else:
             pos_data = []
             for coin, pos in bot.active_positions.items():
                 curr_price = live_prices.get(f"{coin}INR", pos['entry_price'])
-                curr_val = pos['qty'] * curr_price
-                pnl = curr_val - pos['invested']
-                pnl_pct = (pnl / pos['invested']) * 100
+                
+                # Live Net Calculation
+                net_live_value = (pos['qty'] * curr_price) * bot.sell_fee_multiplier
+                net_pnl = net_live_value - pos['invested']
+                net_pnl_pct = (net_pnl / pos['invested']) * 100
                 
                 pos_data.append({
                     "Asset": coin,
-                    "Invested (INR)": f"₹{pos['invested']:.2f}",
-                    "Current Value": f"₹{curr_val:.2f}",
-                    "Avg Entry": f"₹{pos['entry_price']:.2f}",
                     "Current Price": f"₹{curr_price:.2f}",
-                    "Return %": f"{pnl_pct:.2f}%",
-                    "PnL (INR)": f"₹{pnl:.2f}"
+                    "Avg Entry": f"₹{pos['entry_price']:.2f}",
+                    "Actual Cost": f"₹{pos['invested']:.2f}",
+                    "Net Return %": f"{net_pnl_pct:.2f}%",
+                    "Take Profit Target": f"₹{pos.get('tp_price', 0):.2f}",
+                    "Stop Loss Limit": f"₹{pos.get('sl_price', 0):.2f}"
                 })
             st.dataframe(pd.DataFrame(pos_data), use_container_width=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-
         st.subheader("📂 Settled Transactions")
         if not bot.completed_trades:
             st.caption("No completed trades recorded in history file yet.")
@@ -1152,7 +1054,7 @@ elif page == "📊 Live Dashboard":
                     "Entry": f"₹{trade['entry_price']:.2f}",
                     "Exit": f"₹{trade['exit_price']:.2f}",
                     "Net PnL": f"₹{trade['pnl']:.2f}",
-                    "Return %": f"{trade.get('pnl_pct', 0.0):.2f}%"
+                    "Net Return %": f"{trade.get('pnl_pct', 0.0):.2f}%"
                 })
             st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
 
