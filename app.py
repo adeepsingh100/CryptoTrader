@@ -28,7 +28,7 @@ except Exception:
     API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
     GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
-def coindcx_auth_post(endpoint, body):
+def coindcx_auth_post(endpoint, body, max_retries=3):
     url = f"https://api.coindcx.com{endpoint}"
     secret_bytes = bytes(API_SECRET, 'utf-8')
     json_body = json.dumps(body, separators=(',', ':'))
@@ -40,22 +40,40 @@ def coindcx_auth_post(endpoint, body):
         'X-AUTH-SIGNATURE': signature
     }
     
-    try:
-        res = requests.post(url, data=json_body, headers=headers)
+    for attempt in range(max_retries):
         try:
-            data = res.json()
-        except Exception:
+            res = requests.post(url, data=json_body, headers=headers, timeout=15)
+            try:
+                data = res.json()
+            except Exception:
+                res.raise_for_status()
+                return {"error": "Failed to parse CoinDCX API response"}
+                
+            if res.status_code != 200:
+                err_msg = data.get("message", data.get("error", str(data)))
+                log_api_failure(endpoint, f"HTTP {res.status_code}: {err_msg}")
+                return {"error": err_msg}
+            return data
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1) # Retry buffer
+                continue
+            log_api_failure(endpoint, str(e))
+            return {"error": str(e)}
+
+def coindcx_get_with_retry(url, max_retries=3, timeout=15):
+    """Network resilience wrapper for GET requests."""
+    for attempt in range(max_retries):
+        try:
+            res = requests.get(url, timeout=timeout)
             res.raise_for_status()
-            return {"error": "Failed to parse CoinDCX API response"}
-            
-        if res.status_code != 200:
-            err_msg = data.get("message", data.get("error", str(data)))
-            log_api_failure(endpoint, f"HTTP {res.status_code}: {err_msg}")
-            return {"error": err_msg}
-        return data
-    except Exception as e:
-        log_api_failure(endpoint, str(e))
-        return {"error": str(e)}
+            return res.json()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            log_api_failure(url, str(e))
+            return None
 
 # ==========================================
 # 2. CACHED & RELIABLE GOOGLE SHEETS MANAGER
@@ -204,7 +222,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE
+# 3. DUAL TIMEFRAME SPLIT ENGINE (v58)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -288,14 +306,9 @@ class GlobalBotEngine:
         pair = self.market_pair_string.get(market_name, f"B-{coin}_INR")
         actual_interval = interval or self.candle_interval
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={actual_interval}&limit={limit}"
-        try:
-            res = requests.get(url, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            if isinstance(data, list) and len(data) >= 20: return data
-            else: log_api_failure(url, f"Unexpected format or insufficient candles: {data}")
-        except Exception as e:
-            log_api_failure(url, str(e))
+        data = coindcx_get_with_retry(url, max_retries=3, timeout=15)
+        if isinstance(data, list) and len(data) >= 20: 
+            return data
         return None
 
     def process_df_indicators(self, candles_data):
@@ -393,18 +406,15 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR': 
                         self.inr_balance = avail_bal 
 
-        try:
-            markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=10)
-            markets_res.raise_for_status()
-            markets = markets_res.json()
-            
+        # Resilient Market Details and Ticker Fetching
+        markets = coindcx_get_with_retry("https://api.coindcx.com/exchange/v1/markets_details", max_retries=3, timeout=15)
+        if isinstance(markets, list):
             self.market_precision = {m.get('coindcx_name'): int(m.get('target_currency_precision', 5)) for m in markets if m.get('coindcx_name')}
             self.market_min_qty = {m.get('coindcx_name'): float(m.get('min_quantity', 0.0001)) for m in markets if m.get('coindcx_name')}
             self.market_pair_string = {m.get('coindcx_name'): m.get('pair') for m in markets if m.get('coindcx_name') and m.get('pair')}
             
-            tickers_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
-            tickers_res.raise_for_status()
-            tickers = tickers_res.json()
+        tickers = coindcx_get_with_retry("https://api.coindcx.com/exchange/ticker", max_retries=3, timeout=15)
+        if isinstance(tickers, list):
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
             
             if self.auto_top_n > 0 and len(self.candidates) == 0:
@@ -422,9 +432,6 @@ class GlobalBotEngine:
                 inr_markets.sort(key=lambda x: x[1], reverse=True)
                 self.candidates = [m[0] for m in inr_markets[:self.auto_top_n]]
                 self.log_trade("SYSTEM", "AUTO-SCAN", str(self.auto_top_n), "₹0.00", f"Auto-selected top {self.auto_top_n} volatile coins by 24h volume.", "Info")
-        except Exception as e:
-            log_api_failure("markets_details or ticker", str(e))
-            return
 
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
@@ -513,7 +520,7 @@ class GlobalBotEngine:
                 self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
 
     def _scan_for_entries(self):
-        # 1. Evaluate Active Positions (Early Exit Check)
+        # 1. Active Positions Exit Filter
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -552,12 +559,13 @@ class GlobalBotEngine:
                             else:
                                 self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
                         else:
-                            # ✨ FIX: Log AI Hold reasoning when checking active positions
                             self.log_trade("AI HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", decision_data.get("reasoning", "AI decided to ride the trend."), "Trailing Peak")
+                    else:
+                        self.log_trade("LOCAL HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"RSI is {latest_rsi:.1f} (Requires >58 to trigger AI exit scan). Holding locally.", "Trailing")
                 except Exception as e:
                     log_api_failure("groq_chat_completion_sell", str(e))
 
-        # 2. Scan for New Entries
+        # 2. Scanning New Entry Candidates
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
@@ -567,6 +575,8 @@ class GlobalBotEngine:
             best_candidate_15m_str = ""
             best_setup_score = -999.0
             best_atr = 0.0
+            
+            rejected_by_macro_trend = []
 
             for coin in self.candidates:
                 if coin in self.active_positions: continue
@@ -575,7 +585,9 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                if not self.check_htf_trend(coin): continue
+                if not self.check_htf_trend(coin): 
+                    rejected_by_macro_trend.append(coin)
+                    continue
                 
                 candles_1h = self.fetch_candle_data(coin, interval="1h", limit=60)
                 time.sleep(0.4)
@@ -685,18 +697,26 @@ class GlobalBotEngine:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
-                        # ✨ FIX: Log AI Hold reasoning when checking new entry candidates
                         self.log_trade("AI HOLD (ENTRY)", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "MTF Scan Hold")
                 except Exception as e:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
+            else:
+                if rejected_by_macro_trend:
+                    if len(rejected_by_macro_trend) > 4:
+                        coin_list_str = f"{len(rejected_by_macro_trend)} assets"
+                    else:
+                        coin_list_str = ", ".join(rejected_by_macro_trend)
+                    self.log_trade("MACRO REJECT", "ALL", "0", "₹0.00", f"Assets {coin_list_str} are trading below 1H 200 EMA. AI scan bypassed.", "Filter Active")
+                else:
+                    self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No valid trade setups found in current market structure.", "Standby")
 
-# Cache Buster v56
+# Cache Buster v58
 @st.cache_resource
-def get_bot_engine_v56():
+def get_bot_engine_v58():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v56()
+bot = get_bot_engine_v58()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -741,7 +761,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 56.0 (Hit Trigger Logging Added)")
+st.sidebar.caption("Version 58.0 (Network Retry Resilience)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -848,7 +868,7 @@ if page == "⚙️ Bot Engine & Settings":
                             var s = Math.floor((distance % 60000) / 1000);
                             var mStr = m < 10 ? "0" + m : m;
                             var sStr = s < 10 ? "0" + s : s;
-                            el.innerHTML = " | ⏳ Next AI Entry Scan in: " + mStr + ":" + sStr;
+                            el.innerHTML = " | ⏳ Next Scan in: " + mStr + ":" + sStr;
                         }}
                     }}
                     updateTimer();
@@ -893,20 +913,18 @@ elif page == "📊 Live Dashboard":
     def portfolio_view():
         live_inr = bot.inr_balance
         live_prices = bot.last_prices.copy()
-        try:
-            balance_body = {"timestamp": int(round(time.time() * 1000))}
-            balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
-            if isinstance(balances_data, list):
-                for b in balances_data:
-                    if b.get('currency') == 'INR':
-                        live_inr = float(b.get('balance', 0))
-                        
-            tickers = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10).json()
-            if isinstance(tickers, list):
-                for t in tickers:
-                    if 'market' in t: live_prices[t['market']] = float(t['last_price'])
-        except Exception as e:
-            log_api_failure("Dashboard Balance/Ticker Fetch", str(e))
+        
+        balance_body = {"timestamp": int(round(time.time() * 1000))}
+        balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body, max_retries=2)
+        if isinstance(balances_data, list):
+            for b in balances_data:
+                if b.get('currency') == 'INR':
+                    live_inr = float(b.get('balance', 0))
+                    
+        tickers = coindcx_get_with_retry("https://api.coindcx.com/exchange/ticker", max_retries=2, timeout=10)
+        if isinstance(tickers, list):
+            for t in tickers:
+                if 'market' in t: live_prices[t['market']] = float(t['last_price'])
         
         ist_offset = timedelta(hours=5, minutes=30)
         now_ist = datetime.now(timezone.utc) + ist_offset
