@@ -220,7 +220,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. INSTITUTIONAL PRO-TRADER ENGINE (v48)
+# 3. DUAL TIMEFRAME (1H + 15M) PRO ENGINE
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -241,7 +241,7 @@ class GlobalBotEngine:
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
-        self.candle_interval = "15m" 
+        self.candle_interval = "15m"  # Base execution timeframe
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -294,15 +294,11 @@ class GlobalBotEngine:
         self.is_running = False
 
     def get_seconds_to_next_candle(self):
-        """✨ NEW: Mathematical Clock-Lock. Calculates exact ms until the 15m candle closes + 1.5s latency buffer."""
+        """Calculates exact milliseconds until the 15m candle closes + 1.5s latency buffer."""
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
         interval_sec = interval_map.get(self.candle_interval, 900)
         now = time.time()
-        
-        # Calculate exactly when the next candle block starts (e.g. 15m intervals -> xx:00, xx:15...)
         next_candle_time = ((now // interval_sec) + 1) * interval_sec
-        
-        # Add a strict 1.5-second buffer to ensure the Exchange's OHLCV aggregation is fully complete
         return (next_candle_time - now) + 1.5
 
     def fetch_candle_data(self, coin, interval=None, limit=40):
@@ -323,32 +319,49 @@ class GlobalBotEngine:
             log_api_failure(url, str(e))
         return None
 
-    def check_htf_trend(self, coin):
-        """
-        ✨ NEW: Institutional MTF Trend Filter.
-        Because CoinDCX lacks 4h API candles, we fetch '1h' candles and calculate a 200 EMA 
-        (Mathematically identical to a 4H 50-EMA). Bot only trades LONG if price > Macro Trend.
-        """
-        candles = self.fetch_candle_data(coin, interval="1h", limit=250)
-        time.sleep(0.5) 
+    def process_df_indicators(self, candles_data):
+        """Processes OHLCV candles into a clean Pandas DataFrame with technical indicators."""
+        df = pd.DataFrame(candles_data)
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['close'] = df['close'].astype(float)
+        df = df.sort_values(by='time', ascending=True)
+
+        # ATR (14)
+        df['prev_close'] = df['close'].shift(1)
+        df['tr1'] = df['high'] - df['low']
+        df['tr2'] = (df['high'] - df['prev_close']).abs()
+        df['tr3'] = (df['low'] - df['prev_close']).abs()
+        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+        df['ATR'] = df['tr'].rolling(window=14).mean()
+
+        # RSI (14)
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -1 * delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        # MACD
+        exp1 = df['close'].ewm(span=12, adjust=False).mean()
+        exp2 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp1 - exp2
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['MACD_Hist'] = df['MACD'] - df['Signal']
+
+        # Bollinger Bands (20, 2)
+        df['SMA_20'] = df['close'].rolling(window=20).mean()
+        df['STD_20'] = df['close'].rolling(window=20).std()
+        df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
+        df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
         
-        if candles and len(candles) >= 200:
-            try:
-                df = pd.DataFrame(candles)
-                df['close'] = df['close'].astype(float)
-                df = df.sort_values(by='time', ascending=True)
-                
-                # Calculate 200 EMA on 1H Chart (Macro proxy for 4H 50-EMA)
-                df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
-                
-                latest_close = df['close'].iloc[-1]
-                latest_ema = df['EMA_200'].iloc[-1]
-                
-                return latest_close > latest_ema # Returns True ONLY if in a Bullish Macro Trend
-            except Exception as e:
-                log_api_failure("check_htf_trend (Pandas Error)", str(e))
-                
-        return True # Failsafe if API lacks 200hr history for a new coin
+        # 50 EMA for Trend
+        df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+
+        return df
 
     def check_market_regime(self):
         candles = self.fetch_candle_data("BTC", limit=60)
@@ -371,7 +384,6 @@ class GlobalBotEngine:
         return "NEUTRAL"
 
     def _run_loop(self):
-        # Run immediately on boot
         while self.is_running:
             try:
                 self._execute_cycle()
@@ -381,7 +393,6 @@ class GlobalBotEngine:
             if not self.is_running: break
             sleep_seconds = self.get_seconds_to_next_candle()
             
-            # Use responsive 1-second loop so the "Stop" button remains instant
             while sleep_seconds > 0 and self.is_running:
                 time.sleep(1)
                 sleep_seconds -= 1
@@ -436,7 +447,7 @@ class GlobalBotEngine:
             self.log_trade("API RETRY", "MARKET", "0", "₹0.00", f"Failed to reach CoinDCX API. Retrying next cycle.", "API Pause")
             return
 
-        # 1. Sync Existing Holdings
+        # 1. Sync Holdings
         for coin in self.candidates:
             if coin in actual_balances and coin not in self.active_positions:
                 market = f"{coin}INR"
@@ -444,7 +455,6 @@ class GlobalBotEngine:
                 if curr_price:
                     value = actual_balances[coin] * curr_price
                     if value > 50:
-                        # Legacy positions caught by sync won't have dynamic ATR targets initially
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
@@ -459,7 +469,7 @@ class GlobalBotEngine:
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
                 del self.active_positions[coin]
 
-        # 2. Bear Shield Check (Macro Market Defense)
+        # 2. Bear Shield Check
         if self.enable_bear_shield:
             market_state = self.check_market_regime()
             time.sleep(0.5) 
@@ -478,7 +488,7 @@ class GlobalBotEngine:
                         formatted_qty = f"{sell_qty:.{precision}f}"
                         order_body = {
                             "side": "sell",
-                            "order_type": "limit_order", # ✨ FIX: Limit Order Fee Optimization
+                            "order_type": "limit_order",
                             "market": market,
                             "price_per_unit": float(curr_price),
                             "total_quantity": float(formatted_qty), 
@@ -509,7 +519,7 @@ class GlobalBotEngine:
                 self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active; pausing new buys.", "Shield Active")
                 return 
 
-        # 3. Manage Active Positions (Dynamic ATR Exit AI)
+        # 3. Manage Active Positions (Exits)
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -522,35 +532,12 @@ class GlobalBotEngine:
             ai_sell_signal = False
             ai_reason = ""
             
-            candles_data = self.fetch_candle_data(coin)
+            candles_15m = self.fetch_candle_data(coin, interval="15m")
             time.sleep(0.5) 
             
-            if candles_data:
+            if candles_15m:
                 try:
-                    df = pd.DataFrame(candles_data)
-                    df['close'] = df['close'].astype(float)
-                    df['high'] = df['high'].astype(float)
-                    df['low'] = df['low'].astype(float)
-                    df = df.sort_values(by='time', ascending=True)
-                    
-                    delta = df['close'].diff()
-                    gain = delta.clip(lower=0)
-                    loss = -1 * delta.clip(upper=0)
-                    avg_gain = gain.rolling(window=14).mean()
-                    avg_loss = loss.rolling(window=14).mean()
-                    rs = avg_gain / avg_loss
-                    df['RSI'] = 100 - (100 / (1 + rs))
-
-                    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-                    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-                    df['MACD'] = exp1 - exp2
-                    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-                    df['MACD_Hist'] = df['MACD'] - df['Signal']
-
-                    df['SMA_20'] = df['close'].rolling(window=20).mean()
-                    df['STD_20'] = df['close'].rolling(window=20).std()
-                    df['Upper_BB'] = df['SMA_20'] + (df['STD_20'] * 2)
-                    
+                    df = self.process_df_indicators(candles_15m)
                     latest_rsi = df['RSI'].iloc[-1]
                     
                     if latest_rsi > 58 or curr_price >= df['Upper_BB'].iloc[-1]:
@@ -569,7 +556,7 @@ class GlobalBotEngine:
                             model="openai/gpt-oss-120b",
                             messages=[
                                 {"role": "system", "content": sell_prompt},
-                                {"role": "user", "content": f"Held asset {market} ({self.candle_interval} candles):\n\n{df_str}"}
+                                {"role": "user", "content": f"Held asset {market} (15m candles):\n\n{df_str}"}
                             ],
                             response_format={"type": "json_object"},
                             temperature=0.1
@@ -583,7 +570,6 @@ class GlobalBotEngine:
                 except Exception as e:
                     log_api_failure("groq_chat_completion_sell", str(e))
 
-            # ✨ NEW: Volatility-Based Dynamic Targeting 
             is_tp = curr_price >= pos.get('tp_price', float('inf'))
             is_sl = curr_price <= pos.get('sl_price', 0.0)
             
@@ -601,7 +587,7 @@ class GlobalBotEngine:
                     formatted_qty = f"{sell_qty:.{precision}f}"
                     order_body = {
                         "side": "sell",
-                        "order_type": "limit_order", # ✨ FIX: Limit Order
+                        "order_type": "limit_order",
                         "market": market,
                         "price_per_unit": float(curr_price),
                         "total_quantity": float(formatted_qty), 
@@ -637,14 +623,15 @@ class GlobalBotEngine:
             self.cooldown_counter -= 1
             return
 
-        # 4. Scan Candidates for New Buys
+        # 4. MULTI-TIMEFRAME SCANNER (1H + 15M)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
             best_candidate_market = None
             best_candidate_price = 0
-            best_candidate_df_str = ""
+            best_candidate_1h_str = ""
+            best_candidate_15m_str = ""
             best_setup_score = -999.0
             best_atr = 0.0
             scan_success_count = 0
@@ -656,101 +643,86 @@ class GlobalBotEngine:
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                # ✨ NEW: MTF Trend Filter (No buying below the Macro Line)
-                if not self.check_htf_trend(coin):
-                    # Silently skip buying if asset is in a macro downtrend
-                    continue
+                # Fetch BOTH 1-Hour and 15-Minute Candle Data
+                candles_1h = self.fetch_candle_data(coin, interval="1h", limit=60)
+                time.sleep(0.4)
+                candles_15m = self.fetch_candle_data(coin, interval="15m", limit=40)
+                time.sleep(0.4)
                 
-                candles_data = self.fetch_candle_data(coin)
-                time.sleep(0.5) 
-                
-                if candles_data:
+                if candles_1h and candles_15m:
                     try:
-                        df = pd.DataFrame(candles_data)
-                        df['open'] = df['open'].astype(float)
-                        df['high'] = df['high'].astype(float)
-                        df['low'] = df['low'].astype(float)
-                        df['close'] = df['close'].astype(float)
-                        df = df.sort_values(by='time', ascending=True)
+                        # Process 1-Hour HTF DataFrame
+                        df_1h = self.process_df_indicators(candles_1h)
+                        df_1h['time'] = pd.to_datetime(df_1h['time'], unit='ms')
+                        df_1h_str = df_1h[['time', 'open', 'high', 'low', 'close', 'RSI', 'EMA_50', 'MACD_Hist']].tail(6).to_string(index=False)
                         
-                        # Calculate ATR(14) dynamically
-                        df['prev_close'] = df['close'].shift(1)
-                        df['tr1'] = df['high'] - df['low']
-                        df['tr2'] = (df['high'] - df['prev_close']).abs()
-                        df['tr3'] = (df['low'] - df['prev_close']).abs()
-                        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-                        df['ATR'] = df['tr'].rolling(window=14).mean()
-                        latest_atr = df['ATR'].iloc[-1]
+                        # Process 15-Minute LTF DataFrame
+                        df_15m = self.process_df_indicators(candles_15m)
+                        df_15m['time'] = pd.to_datetime(df_15m['time'], unit='ms')
+                        df_15m_str = df_15m[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ATR']].tail(8).to_string(index=False)
                         
-                        delta = df['close'].diff()
-                        gain = delta.clip(lower=0)
-                        loss = -1 * delta.clip(upper=0)
-                        avg_gain = gain.rolling(window=14).mean()
-                        avg_loss = loss.rolling(window=14).mean()
-                        rs = avg_gain / avg_loss
-                        df['RSI'] = 100 - (100 / (1 + rs))
-
-                        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-                        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-                        df['MACD'] = exp1 - exp2
-                        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-                        df['MACD_Hist'] = df['MACD'] - df['Signal']
-
-                        df['SMA_20'] = df['close'].rolling(window=20).mean()
-                        df['STD_20'] = df['close'].rolling(window=20).std()
-                        df['Lower_BB'] = df['SMA_20'] - (df['STD_20'] * 2)
-                        
-                        latest_rsi = df['RSI'].iloc[-1]
-                        latest_close = df['close'].iloc[-1]
-                        lower_bb = df['Lower_BB'].iloc[-1]
+                        latest_rsi_15m = df_15m['RSI'].iloc[-1]
+                        latest_close_15m = df_15m['close'].iloc[-1]
+                        lower_bb_15m = df_15m['Lower_BB'].iloc[-1]
+                        latest_atr_15m = df_15m['ATR'].iloc[-1]
                         
                         scan_success_count += 1
                         
-                        bb_distance_pct = ((latest_close - lower_bb) / lower_bb) * 100
-                        setup_score = (100.0 - latest_rsi) - (bb_distance_pct * 2)
+                        bb_distance_pct = ((latest_close_15m - lower_bb_15m) / lower_bb_15m) * 100
+                        setup_score = (100.0 - latest_rsi_15m) - (bb_distance_pct * 2)
 
                         if setup_score > best_setup_score:
                             best_setup_score = setup_score
                             best_candidate_coin = coin
                             best_candidate_market = market
                             best_candidate_price = curr_price
-                            best_atr = latest_atr
-                            df['time'] = pd.to_datetime(df['time'], unit='ms')
-                            best_candidate_df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ATR']].tail(8).to_string(index=False)
+                            best_atr = latest_atr_15m
+                            best_candidate_1h_str = df_1h_str
+                            best_candidate_15m_str = df_15m_str
                     except Exception as e:
-                        log_api_failure(f"Dataframe calculation ({coin})", str(e))
+                        log_api_failure(f"MTF calculation ({coin})", str(e))
                         continue
 
             if scan_success_count == 0 and len([c for c in self.candidates if c not in self.active_positions]) > 0:
                 self.log_trade("API RETRY", "MARKET", "0", "₹0.00", "CoinDCX endpoints temporary delay. Retrying next cycle.", "API Pause")
                 return
 
-            if best_candidate_coin and best_candidate_df_str:
+            if best_candidate_coin and best_candidate_1h_str and best_candidate_15m_str:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are a ruthless quantitative crypto trader analyzing live candlestick data (OHLC), RSI, MACD Histogram, and Lower Bollinger Bands.
-                Your task is to identify precision bounce setups and reject dangerous 'falling knives'.
+                system_prompt = """You are an elite quantitative crypto hedge fund manager specializing in Multi-Timeframe (MTF) market structure analysis.
+                Your job is to analyze BOTH the 1-Hour (Macro Trend) and 15-Minute (Trigger Entry) charts before issuing a decision.
                 
-                Evaluate the candlestick structure:
-                1. Look for rejection wicks at the low prices or candles closing higher than opens (bullish reversal).
-                2. Check if the MACD Histogram is curving upwards (loss of downward momentum).
-                3. Check if price is holding or bouncing near/above Lower Bollinger Band support.
+                Evaluation Rules:
+                1. 1-Hour Macro Filter: Ensure the 1-Hour price is holding key support or aligned with positive MACD/EMA momentum. Reject if 1-Hour is breaking down hard.
+                2. 15-Minute Trigger: Look for bullish bounce setups (low rejection wicks, holding near/above Lower Bollinger Band, RSI oversold recovery).
+                3. Confluence Requirement: Only output 'BUY' if BOTH timeframes agree.
                 
                 Respond ONLY in JSON format:
-                {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the price action"}"""
+                {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the MTF alignment"}"
+                """
+                
+                mtf_user_prompt = f"""Analyze Multi-Timeframe data for candidate {best_candidate_market}:
+
+=== 1-HOUR CHART (MACRO TREND & CONTEXT) ===
+{best_candidate_1h_str}
+
+=== 15-MINUTE CHART (PRECISION ENTRY TRIGGER) ===
+{best_candidate_15m_str}
+"""
                 
                 try:
                     response = client.chat.completions.create(
                         model="openai/gpt-oss-120b",
                         messages=[
                             {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Analyze candles for candidate {best_candidate_market} ({self.candle_interval} chart):\n\n{best_candidate_df_str}"}
+                            {"role": "user", "content": mtf_user_prompt}
                         ],
                         response_format={"type": "json_object"},
                         temperature=0.1
                     )
                     decision_data = json.loads(response.choices[0].message.content)
                     action = decision_data.get("action", "HOLD").upper()
-                    reasoning = decision_data.get("reasoning", "AI evaluated market structure.")
+                    reasoning = decision_data.get("reasoning", "AI evaluated MTF market structure.")
 
                     if action == "BUY":
                         precision = self.market_precision.get(best_candidate_market, 5)
@@ -778,7 +750,7 @@ class GlobalBotEngine:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                             order_body = {
                                 "side": "buy",
-                                "order_type": "limit_order", # ✨ FIX: Limit Orders exclusively
+                                "order_type": "limit_order",
                                 "market": best_candidate_market,
                                 "price_per_unit": float(best_candidate_price),
                                 "total_quantity": float(formatted_qty), 
@@ -786,7 +758,6 @@ class GlobalBotEngine:
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
-                                # ✨ NEW: Volatility Scaled Risk Management parameters stored locally
                                 target_tp = best_candidate_price + (3.0 * best_atr)
                                 target_sl = best_candidate_price - (1.5 * best_atr)
                                 
@@ -803,19 +774,19 @@ class GlobalBotEngine:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
-                        self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "Candle Scan Hold")
+                        self.log_trade("AI HOLD", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "MTF Scan Hold")
                 except Exception as e:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v48
+# Cache Buster v49
 @st.cache_resource
-def get_bot_engine_v48():
+def get_bot_engine_v49():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v48()
+bot = get_bot_engine_v49()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -878,7 +849,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 48.0 (Institutional Optimization)")
+st.sidebar.caption("Version 49.0 (Dual Timeframe 1H+15M AI Analysis)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -912,7 +883,7 @@ if page == "⚙️ Bot Engine & Settings":
         timeframes = ["1m", "15m", "1h", "1d"]
         default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 1
         candle_interval = st.selectbox(
-            "Candle Timeframe (Chart Size)", 
+            "Candle Timeframe (Trigger Execution)", 
             timeframes, 
             index=default_idx
         )
@@ -930,8 +901,8 @@ if page == "⚙️ Bot Engine & Settings":
     with colB:
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
         
-    st.info(f"📈 **Dynamic Risk Engine:** Static targets have been replaced with live volatility tracking. Take-Profit is automatically locked to **3.0x ATR(14)**, and Stop-Loss dynamically trails at **1.5x ATR(14)**.", icon="⚙️")
-    st.info(f"⏱️ **Precision Clock-Locking:** The bot's execution timer is mathematically locked to trigger exactly upon the closure of the selected **{candle_interval}** candle (+1.5s latency buffer).", icon="🔒")
+    st.info("🧠 **Dual Timeframe AI Analysis:** The Groq AI model now evaluates both **1-Hour** (Macro Trend) and **15-Minute** (Precision Entry) charts simultaneously before authorizing any trade.", icon="📊")
+    st.info(f"⏱️ **Clock-Locking Active:** Timer is locked to trigger exactly on **{candle_interval}** candle closes (+1.5s latency buffer).", icon="🔒")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
@@ -970,7 +941,7 @@ if page == "⚙️ Bot Engine & Settings":
             else:
                 asset_str = f"{len(bot.candidates)} core assets ({', '.join(bot.candidates)})"
                 
-            st.info(f"⚡ **System Active:** Monitoring {asset_str} on {bot.candle_interval} timeframe | HTF Filter: Enabled | Bear Shield: {shield_status}")
+            st.info(f"⚡ **System Active:** Monitoring {asset_str} on {bot.candle_interval} + 1H MTF | Bear Shield: {shield_status}")
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
