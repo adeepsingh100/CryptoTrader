@@ -1,6 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+import numpy as np  # ✨ NEW: Required for Institutional ADX Calculation
 import json
 import time
 import hmac
@@ -35,7 +36,6 @@ def log_api_failure(endpoint, error_msg):
     global _last_error_log_times
     current_time = time.time()
     
-    # Block identical endpoint spam for 5 minutes (300 seconds)
     if endpoint in _last_error_log_times and (current_time - _last_error_log_times[endpoint]) < 300:
         return
 
@@ -86,7 +86,6 @@ def coindcx_auth_post(endpoint, body, max_retries=3, timeout=20):
             return {"error": str(e)}
 
 def coindcx_get_with_retry(url, max_retries=3, timeout=20):
-    """Network resilience wrapper for GET requests with 20s timeout."""
     for attempt in range(max_retries):
         try:
             res = requests.get(url, timeout=timeout)
@@ -234,7 +233,7 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE (v61)
+# 3. THE INSTITUTIONAL ENGINE (v62)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -314,9 +313,8 @@ class GlobalBotEngine:
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
         return interval_map.get(self.candle_interval, 900)
 
-    def fetch_candle_data(self, coin, interval=None, limit=40):
+    def fetch_candle_data(self, coin, interval=None, limit=50):
         market_name = f"{coin}INR"
-        # ✨ FIX: The fallback strictly forces "I-" natively for INR pairings to block USD data mixing
         pair = self.market_pair_string.get(market_name, f"I-{coin}_INR")
         actual_interval = interval or self.candle_interval
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={actual_interval}&limit={limit}"
@@ -331,7 +329,11 @@ class GlobalBotEngine:
         df['high'] = df['high'].astype(float)
         df['low'] = df['low'].astype(float)
         df['close'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float) # ✨ Fetch Volume Data
         df = df.sort_values(by='time', ascending=True)
+
+        # ✨ Volume SMA (Filter #2)
+        df['Vol_SMA_20'] = df['volume'].rolling(window=20).mean()
 
         df['prev_close'] = df['close'].shift(1)
         df['tr1'] = df['high'] - df['low']
@@ -339,6 +341,18 @@ class GlobalBotEngine:
         df['tr3'] = (df['low'] - df['prev_close']).abs()
         df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
         df['ATR'] = df['tr'].rolling(window=14).mean()
+        
+        # ✨ ADX Trend Strength Calculator (Filter #1)
+        df['up_move'] = df['high'].diff()
+        df['down_move'] = df['low'].shift(1) - df['low']
+        df['+dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
+        df['-dm'] = np.where((df['down_move'] > df['up_move']) & (df['down_move'] > 0), df['down_move'], 0.0)
+        
+        atr_14 = df['tr'].ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        df['+di'] = 100 * (df['+dm'].ewm(alpha=1/14, min_periods=14, adjust=False).mean() / atr_14)
+        df['-di'] = 100 * (df['-dm'].ewm(alpha=1/14, min_periods=14, adjust=False).mean() / atr_14)
+        adx_dx = 100 * abs(df['+di'] - df['-di']) / (df['+di'] + df['-di'])
+        df['ADX'] = adx_dx.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
 
         delta = df['close'].diff()
         gain = delta.clip(lower=0)
@@ -443,7 +457,6 @@ class GlobalBotEngine:
             
             if self.auto_top_n > 0 and len(self.candidates) == 0:
                 inr_markets = []
-                # ✨ FIX: Expanded blacklist to aggressively block 12 USD Stablecoins from Auto-Scan
                 stablecoins = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'BUSD', 'USDD', 'PYUSD', 'USDE', 'FRAX', 'USDP', 'CUSD'}
                 for t in tickers:
                     market = t.get('market', '')
@@ -567,10 +580,10 @@ class GlobalBotEngine:
                     
                     if latest_rsi > 58 or curr_price >= df['Upper_BB'].iloc[-1]:
                         df['time'] = pd.to_datetime(df['time'], unit='ms')
-                        df_str = df[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
+                        df_str = df[['time', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
                         
                         client = Groq(api_key=GROQ_API_KEY)
-                        sell_prompt = """You are an elite quantitative crypto hedge fund manager. Analyze the raw candlestick data. Determine if the coin has reached a local peak or momentum is exhausting. Output 'SELL' if price is overextended near/above Upper_BB and candle wicks/MACD show slowing buyer momentum. Output 'HOLD' if the trend remains strong upwards. Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short sentence"}"""
+                        sell_prompt = """You are an elite quantitative crypto hedge fund manager. Output 'SELL' if price is overextended near Upper_BB and momentum is exhausting. Output 'HOLD' if the trend remains strong upwards. Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short sentence"}"""
                         
                         response = client.chat.completions.create(
                             model="llama-3.3-70b-versatile", 
@@ -583,17 +596,17 @@ class GlobalBotEngine:
                         decision_data = json.loads(response.choices[0].message.content)
                         if decision_data.get("action", "").upper() == "SELL":
                             if pos['entry_price'] < curr_price < breakeven_price:
-                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Gross profit is in the Dead Zone and cannot clear the Exchange Fee/TDS hurdle.", "Tax Shield")
+                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Profit is in Dead Zone.", "Tax Shield")
                             else:
                                 self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
                         else:
-                            self.log_trade("AI HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", decision_data.get("reasoning", "AI decided to ride the trend."), "Trailing Peak")
+                            self.log_trade("AI HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
                     else:
-                        self.log_trade("LOCAL HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"RSI is {latest_rsi:.1f} (Requires >58 to trigger AI exit scan). Holding locally.", "Trailing")
+                        self.log_trade("LOCAL HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"RSI is {latest_rsi:.1f}. Waiting for momentum.", "Trailing")
                 except Exception as e:
                     pass
 
-        # 2. Scanning New Entry Candidates
+        # 2. Scanning New Entry Candidates (Institutional Filters)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
@@ -604,7 +617,9 @@ class GlobalBotEngine:
             best_setup_score = -999.0
             best_atr = 0.0
             
-            rejected_by_macro_trend = []
+            rejected_by_macro = []
+            rejected_by_adx = []
+            rejected_by_vol = []
 
             for coin in self.candidates:
                 if coin in self.active_positions: continue
@@ -614,28 +629,42 @@ class GlobalBotEngine:
                 if not curr_price: continue
                 
                 if not self.check_htf_trend(coin): 
-                    rejected_by_macro_trend.append(coin)
+                    rejected_by_macro.append(coin)
                     continue
                 
                 candles_1h = self.fetch_candle_data(coin, interval="1h", limit=60)
                 time.sleep(0.4)
-                candles_15m = self.fetch_candle_data(coin, interval="15m", limit=40)
+                candles_15m = self.fetch_candle_data(coin, interval="15m", limit=50)
                 time.sleep(0.4)
                 
                 if candles_1h and candles_15m:
                     try:
                         df_1h = self.process_df_indicators(candles_1h)
                         df_1h['time'] = pd.to_datetime(df_1h['time'], unit='ms')
-                        df_1h_str = df_1h[['time', 'open', 'high', 'low', 'close', 'RSI', 'EMA_50', 'MACD_Hist']].tail(6).to_string(index=False)
+                        df_1h_str = df_1h[['time', 'close', 'RSI', 'EMA_50', 'MACD_Hist']].tail(6).to_string(index=False)
                         
                         df_15m = self.process_df_indicators(candles_15m)
                         df_15m['time'] = pd.to_datetime(df_15m['time'], unit='ms')
-                        df_15m_str = df_15m[['time', 'open', 'high', 'low', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ATR']].tail(8).to_string(index=False)
                         
                         latest_rsi_15m = df_15m['RSI'].iloc[-1]
                         latest_close_15m = df_15m['close'].iloc[-1]
                         lower_bb_15m = df_15m['Lower_BB'].iloc[-1]
                         latest_atr_15m = df_15m['ATR'].iloc[-1]
+                        
+                        # ✨ Institutional Filter Gate
+                        latest_adx = df_15m['ADX'].iloc[-1]
+                        latest_vol = df_15m['volume'].iloc[-1]
+                        latest_vol_sma = df_15m['Vol_SMA_20'].iloc[-1]
+                        
+                        if pd.isna(latest_adx) or latest_adx < 20.0:
+                            rejected_by_adx.append(coin)
+                            continue
+                            
+                        if latest_vol < latest_vol_sma:
+                            rejected_by_vol.append(coin)
+                            continue
+                        
+                        df_15m_str = df_15m[['time', 'close', 'RSI', 'MACD_Hist', 'Lower_BB', 'ADX']].tail(8).to_string(index=False)
                         
                         bb_distance_pct = ((latest_close_15m - lower_bb_15m) / lower_bb_15m) * 100
                         setup_score = (100.0 - latest_rsi_15m) - (bb_distance_pct * 2)
@@ -653,10 +682,10 @@ class GlobalBotEngine:
 
             if best_candidate_coin and best_candidate_1h_str and best_candidate_15m_str:
                 client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are an elite quantitative crypto hedge fund manager specializing in Multi-Timeframe (MTF) market structure analysis. Your job is to analyze BOTH the 1-Hour (Macro Trend) and 15-Minute (Trigger Entry) charts before issuing a decision.
+                system_prompt = """You are an elite quantitative crypto hedge fund manager specializing in Multi-Timeframe (MTF) market structure analysis. 
                 Evaluation Rules:
-                1. 1-Hour Macro Filter: Ensure the 1-Hour price is holding key support or aligned with positive MACD/EMA momentum. Reject if 1-Hour is breaking down hard.
-                2. 15-Minute Trigger: Look for bullish bounce setups (low rejection wicks, holding near/above Lower Bollinger Band, RSI oversold recovery).
+                1. 1-Hour Macro Filter: Ensure the 1-Hour price is holding key support or aligned with positive MACD/EMA momentum.
+                2. 15-Minute Trigger: ADX and Volume filters have already passed. Look for bullish bounce setups (low rejection wicks, holding near/above Lower Bollinger Band, RSI oversold recovery).
                 3. Confluence Requirement: Only output 'BUY' if BOTH timeframes agree.
                 Respond ONLY in JSON format: {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the MTF alignment"}"""
                 
@@ -705,10 +734,11 @@ class GlobalBotEngine:
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
                             if "orders" in res or "id" in res:
+                                # ✨ Institutional RRR: Force minimum +3.0% Net Profit target, swing up to 4x ATR
                                 breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
-                                min_net_profit_tp = breakeven_price * 1.005 
+                                min_net_profit_tp = breakeven_price * 1.030 
                                 
-                                target_tp = best_candidate_price + (3.0 * best_atr)
+                                target_tp = best_candidate_price + (4.0 * best_atr)
                                 if target_tp < min_net_profit_tp:
                                     target_tp = min_net_profit_tp
                                     
@@ -728,21 +758,25 @@ class GlobalBotEngine:
                 except Exception as e:
                     pass
             else:
-                if rejected_by_macro_trend:
-                    if len(rejected_by_macro_trend) > 4:
-                        coin_list_str = f"{len(rejected_by_macro_trend)} assets"
-                    else:
-                        coin_list_str = ", ".join(rejected_by_macro_trend)
-                    self.log_trade("MACRO REJECT", "ALL", "0", "₹0.00", f"Assets {coin_list_str} are trading below 1H 200 EMA. AI scan bypassed.", "Filter Active")
+                # Log the specific reason coins failed the pre-filters
+                if rejected_by_macro:
+                    coins = f"{len(rejected_by_macro)} assets" if len(rejected_by_macro) > 4 else ", ".join(rejected_by_macro)
+                    self.log_trade("MACRO REJECT", "ALL", "0", "₹0.00", f"Assets {coins} are trading below 1H 200 EMA.", "Filter Active")
+                elif rejected_by_adx:
+                    coins = f"{len(rejected_by_adx)} assets" if len(rejected_by_adx) > 4 else ", ".join(rejected_by_adx)
+                    self.log_trade("MOMENTUM REJECT", "ALL", "0", "₹0.00", f"Assets {coins} have ADX < 20 (Chop / No Trend).", "Filter Active")
+                elif rejected_by_vol:
+                    coins = f"{len(rejected_by_vol)} assets" if len(rejected_by_vol) > 4 else ", ".join(rejected_by_vol)
+                    self.log_trade("VOLUME REJECT", "ALL", "0", "₹0.00", f"Assets {coins} lack volume surge to confirm entry.", "Filter Active")
                 else:
                     self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No valid trade setups found in current market structure.", "Standby")
 
-# Cache Buster v61
+# Cache Buster v62
 @st.cache_resource
-def get_bot_engine_v61():
+def get_bot_engine_v62():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v61()
+bot = get_bot_engine_v62()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -790,7 +824,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 61.0 (Native INR Chart Fix)")
+st.sidebar.caption("Version 62.0 (Institutional ADX/Vol Strategy)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
