@@ -203,7 +203,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE (v53)
+# 3. DUAL TIMEFRAME SPLIT ENGINE (v54)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -221,13 +221,11 @@ class GlobalBotEngine:
         
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.auto_top_n = 0 
-        self.enable_bear_shield = True
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
         self.candle_interval = "15m"  
         
-        # ✨ Exact Tax & Fee Identifiers
         self.exchange_fee_pct = 0.5 
         self.tds_pct = 1.0 
         
@@ -243,12 +241,10 @@ class GlobalBotEngine:
 
     @property
     def buy_fee_multiplier(self):
-        # 0.5% fee + 18% GST = 0.59% real fee. Cost of buy = Order Value * 1.0059
         return 1 + (self.exchange_fee_pct / 100.0 * 1.18)
 
     @property
     def sell_fee_multiplier(self):
-        # 0.5% fee + 18% GST + 1% TDS. Cash received = Order Value * 0.9841
         return 1 - (self.exchange_fee_pct / 100.0 * 1.18) - (self.tds_pct / 100.0)
 
     def log_trade(self, action, coin, qty, value, reason, status):
@@ -260,7 +256,7 @@ class GlobalBotEngine:
         if len(self.trade_log) > 100: self.trade_log.pop()
         gs_manager.append_log(log_entry)
 
-    def start(self, candidate_str, auto_top_n, enable_bear_shield, max_budget, trade_amount, exchange_fee_pct, tds_pct, candle_interval):
+    def start(self, candidate_str, auto_top_n, max_budget, trade_amount, exchange_fee_pct, tds_pct, candle_interval):
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
@@ -269,7 +265,6 @@ class GlobalBotEngine:
                 raw_coins = [c.strip().upper() for c in candidate_str.split(",") if c.strip()]
                 self.candidates = raw_coins if raw_coins else ["BTC", "ETH", "SOL", "XRP", "DOGE"]
             
-            self.enable_bear_shield = enable_bear_shield
             self.max_budget = max_budget
             self.trade_amount = trade_amount
             self.exchange_fee_pct = exchange_fee_pct
@@ -355,22 +350,6 @@ class GlobalBotEngine:
                 log_api_failure("check_htf_trend (Pandas Error)", str(e))
         return True 
 
-    def check_market_regime(self):
-        candles = self.fetch_candle_data("BTC", limit=60)
-        if candles:
-            try:
-                df = pd.DataFrame(candles)
-                df['close'] = df['close'].astype(float)
-                df = df.sort_values(by='time', ascending=True)
-                df['SMA_50'] = df['close'].rolling(window=50).mean()
-                latest_close = df['close'].iloc[-1]
-                latest_sma50 = df['SMA_50'].iloc[-1]
-                if latest_close < latest_sma50: return "BEARISH"
-                else: return "BULLISH"
-            except Exception as e:
-                log_api_failure("check_market_regime (Pandas Error)", str(e))
-        return "NEUTRAL"
-
     def _run_loop(self):
         last_candle_block = 0
         while self.is_running:
@@ -448,7 +427,6 @@ class GlobalBotEngine:
                 if curr_price:
                     value = actual_balances[coin] * curr_price
                     if value > 50:
-                        # Legacy sync - applies true invested value math instantly
                         invested_with_fees = value * self.buy_fee_multiplier
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
@@ -465,14 +443,6 @@ class GlobalBotEngine:
                 del self.active_positions[coin]
 
     def _monitor_live_exits(self):
-        if self.enable_bear_shield:
-            market_state = self.check_market_regime()
-            if market_state == "BEARISH":
-                for coin in list(self.active_positions.keys()):
-                    self._execute_sell(coin, "BEAR LIQUIDATE", "Bear Shield Activated: Liquidated to cash (INR).")
-                self.log_trade("BEAR SHIELD", "MARKET", "0", "₹0.00", "Bitcoin is below 50-SMA. Cash shield active.", "Shield Active")
-                return 
-
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -480,7 +450,6 @@ class GlobalBotEngine:
             
             pos = self.active_positions[coin]
             
-            # True Net Calculation for live TP/SL checking
             net_received = (pos['qty'] * curr_price) * self.sell_fee_multiplier
             net_profit = net_received - pos['invested']
             net_pnl_pct = (net_profit / pos['invested']) * 100
@@ -513,8 +482,6 @@ class GlobalBotEngine:
             }
             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
             if "orders" in res or "id" in res:
-                
-                # ✨ Exact Net Post-Tax Math
                 net_received = gross_value * self.sell_fee_multiplier
                 net_profit = net_received - pos['invested']
                 net_pnl_pct = (net_profit / pos['invested']) * 100
@@ -541,8 +508,6 @@ class GlobalBotEngine:
             if not curr_price: continue
             
             pos = self.active_positions[coin]
-            
-            # ✨ NEW: Breakeven Math for the AI Dead Zone
             breakeven_price = pos['entry_price'] * (self.buy_fee_multiplier / self.sell_fee_multiplier)
             
             candles_15m = self.fetch_candle_data(coin, interval="15m")
@@ -570,10 +535,8 @@ class GlobalBotEngine:
                         )
                         decision_data = json.loads(response.choices[0].message.content)
                         if decision_data.get("action", "").upper() == "SELL":
-                            
-                            # ✨ THE AI DEAD ZONE BLOCKER
                             if pos['entry_price'] < curr_price < breakeven_price:
-                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Gross profit is in the Dead Zone and cannot clear the 2.18% TDS/Fee hurdle.", "Tax Shield")
+                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Gross profit is in the Dead Zone and cannot clear the Exchange Fee/TDS hurdle.", "Tax Shield")
                             else:
                                 self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
                 except Exception as e:
@@ -672,7 +635,6 @@ class GlobalBotEngine:
                             buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
                             actual_cost = buy_crypto_amount * best_candidate_price
                             
-                        # True Invested Amount Includes the 0.59% Buy Fee Deduction
                         total_invested_with_fees = actual_cost * self.buy_fee_multiplier
 
                         if total_invested_with_fees > (self.trade_amount + 15.0):
@@ -688,10 +650,8 @@ class GlobalBotEngine:
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body)
                             if "orders" in res or "id" in res:
-                                
-                                # ✨ NEW: Minimum Net Profit Guarantee
                                 breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
-                                min_net_profit_tp = breakeven_price * 1.005 # Forces an absolute minimum of +0.5% Net Profit
+                                min_net_profit_tp = breakeven_price * 1.005 
                                 
                                 target_tp = best_candidate_price + (3.0 * best_atr)
                                 if target_tp < min_net_profit_tp:
@@ -713,12 +673,12 @@ class GlobalBotEngine:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
 
-# Cache Buster v53
+# Cache Buster v54
 @st.cache_resource
-def get_bot_engine_v53():
+def get_bot_engine_v54():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v53()
+bot = get_bot_engine_v54()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -763,7 +723,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 53.0 (Exact Tax & Fee Accounting)")
+st.sidebar.caption("Version 54.0 (Removed Liquidate Shield)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -799,11 +759,6 @@ if page == "⚙️ Bot Engine & Settings":
             "Candle Timeframe (Trigger Execution)", 
             timeframes, index=default_idx
         )
-    
-    enable_bear_shield = st.checkbox(
-        "🛡️ Enable Macro Market Bear Shield (BTC 50-SMA)", 
-        value=bool(bot.enable_bear_shield)
-    )
 
     st.markdown("<br>#### 💰 Capital & Tax Shield Settings", unsafe_allow_html=True)
     colA, colB, colC = st.columns(3)
@@ -821,7 +776,7 @@ if page == "⚙️ Bot Engine & Settings":
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(candidate_input, top_n, enable_bear_shield, max_bud, trade_amt, exchange_fee_pct, tds_pct, candle_interval)
+            bot.start(candidate_input, top_n, max_bud, trade_amt, exchange_fee_pct, tds_pct, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -844,7 +799,6 @@ if page == "⚙️ Bot Engine & Settings":
             else:
                 timer_str = " | ⏳ Aggregating Data..."
                 
-            shield_status = "Shield Enabled" if bot.enable_bear_shield else "Shield Disabled"
             asset_str = f"Auto-Scanning Top {bot.auto_top_n} Coins" if bot.auto_top_n > 0 and len(bot.candidates) == 0 else f"{len(bot.candidates)} assets ({', '.join(bot.candidates)})"
             
             st.info(f"⚡ **System Active:** High-Frequency Exit Monitor LIVE. {asset_str} {timer_str}")
@@ -923,7 +877,6 @@ elif page == "📊 Live Dashboard":
             trade_dt_ist = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset
             trade_date = trade_dt_ist.date()
             
-            # ✨ NET PnL extracted automatically from v53+ trades
             net_pnl = float(trade.get("pnl", 0.0))
 
             if trade_dt_ist >= two_years_ago:
@@ -956,7 +909,6 @@ elif page == "📊 Live Dashboard":
         
         for coin, pos in bot.active_positions.items():
             live_p = live_prices.get(f"{coin}INR", pos['entry_price'])
-            # Live Exact Net Calculation
             net_live_value = (pos['qty'] * live_p) * bot.sell_fee_multiplier
             unrealized_net_pnl += (net_live_value - pos['invested'])
 
@@ -1022,7 +974,6 @@ elif page == "📊 Live Dashboard":
             for coin, pos in bot.active_positions.items():
                 curr_price = live_prices.get(f"{coin}INR", pos['entry_price'])
                 
-                # Live Net Calculation
                 net_live_value = (pos['qty'] * curr_price) * bot.sell_fee_multiplier
                 net_pnl = net_live_value - pos['invested']
                 net_pnl_pct = (net_pnl / pos['invested']) * 100
