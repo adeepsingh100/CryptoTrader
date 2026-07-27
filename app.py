@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import json
 import time
@@ -203,7 +204,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE (v55)
+# 3. DUAL TIMEFRAME SPLIT ENGINE
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -221,7 +222,6 @@ class GlobalBotEngine:
         
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.auto_top_n = 0 
-        self.enable_bear_shield = True
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
@@ -384,7 +384,6 @@ class GlobalBotEngine:
         
         if isinstance(balances_data, list):
             for b in balances_data:
-                # ✨ FIX: Extract both available and locked balances (prevent disappearing coins)
                 avail_bal = float(b.get('balance', 0))
                 locked_bal = float(b.get('locked_balance', 0))
                 total_bal = avail_bal + locked_bal
@@ -392,7 +391,6 @@ class GlobalBotEngine:
                 if total_bal > 0:
                     actual_balances[b['currency']] = total_bal
                     if b['currency'] == 'INR': 
-                        # For INR, we only care about FREE cash to buy new things
                         self.inr_balance = avail_bal 
 
         try:
@@ -442,15 +440,12 @@ class GlobalBotEngine:
                             "invested": invested_with_fees,
                             "tp_price": curr_price * 1.05, 
                             "sl_price": curr_price * 0.95,
-                            "buy_time": time.time() - 200 # Legacy sync gets instantly deletable
+                            "buy_time": time.time() - 200
                         }
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{invested_with_fees:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
-        # ✨ FIX: API Lag Deletion Protection
         for coin in list(self.active_positions.keys()):
             pos = self.active_positions[coin]
-            
-            # Allow 3 minutes for limit orders to fill and exchange ledgers to update
             if time.time() - pos.get('buy_time', 0) < 180:
                 continue
                 
@@ -678,7 +673,7 @@ class GlobalBotEngine:
                                 self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount, "entry_price": best_candidate_price,
                                     "invested": total_invested_with_fees, "tp_price": target_tp, "sl_price": target_sl,
-                                    "buy_time": time.time() # ✨ FIX: Timestamp added for the 3-minute grace period
+                                    "buy_time": time.time()
                                 }
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
                             else:
@@ -740,7 +735,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 55.0 (API Lag Deletion Protection)")
+st.sidebar.caption("Version 55.0 (Live JS Timer & API Shield)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -809,16 +804,56 @@ if page == "⚙️ Bot Engine & Settings":
     @st.fragment(run_every="10s")
     def bot_logs_view():
         if bot.is_running:
-            if bot.next_scan_epoch > 0:
-                time_left = max(0, int(bot.next_scan_epoch - time.time()))
-                m, s = divmod(time_left, 60)
-                timer_str = f" | ⏳ Next AI Entry Scan in: {m:02d}:{s:02d}"
-            else:
-                timer_str = " | ⏳ Aggregating Data..."
-                
             asset_str = f"Auto-Scanning Top {bot.auto_top_n} Coins" if bot.auto_top_n > 0 and len(bot.candidates) == 0 else f"{len(bot.candidates)} assets ({', '.join(bot.candidates)})"
             
-            st.info(f"⚡ **System Active:** High-Frequency Exit Monitor LIVE. {asset_str} {timer_str}")
+            # ✨ NEW: Client-Side Javascript Live Timer
+            timer_html = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <style>
+                body {{ margin: 0; padding: 0; overflow: hidden; background-color: transparent; }}
+                .info-box {{
+                    background-color: #e8f0fe;
+                    padding: 16px;
+                    border-radius: 8px;
+                    color: #1967d2;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    font-size: 14.5px;
+                    border: 1px solid #d2e3fc;
+                    display: flex;
+                    align-items: center;
+                }}
+            </style>
+            </head>
+            <body>
+                <div class="info-box">
+                    <span><strong>⚡ System Active:</strong> High-Frequency Exit Monitor LIVE. {asset_str} <span id="live-timer"></span></span>
+                </div>
+                <script>
+                    var targetEpoch = {bot.next_scan_epoch * 1000};
+                    function updateTimer() {{
+                        var now = new Date().getTime();
+                        var distance = targetEpoch - now;
+                        var el = document.getElementById('live-timer');
+                        if (distance <= 0) {{
+                            el.innerHTML = " | ⏳ Aggregating Data...";
+                        }} else {{
+                            var m = Math.floor(distance / 60000);
+                            var s = Math.floor((distance % 60000) / 1000);
+                            var mStr = m < 10 ? "0" + m : m;
+                            var sStr = s < 10 ? "0" + s : s;
+                            el.innerHTML = " | ⏳ Next AI Entry Scan in: " + mStr + ":" + sStr;
+                        }}
+                    }}
+                    updateTimer();
+                    setInterval(updateTimer, 1000);
+                </script>
+            </body>
+            </html>
+            """
+            components.html(timer_html, height=55)
+            
         else:
             st.warning("⚠️ **System Idle:** Awaiting execution. Click 'Start Engine' to commence trading.")
             
@@ -844,7 +879,6 @@ if page == "⚙️ Bot Engine & Settings":
             st.dataframe(df_logs, use_container_width=True, hide_index=True)
 
     bot_logs_view()
-
 
 elif page == "📊 Live Dashboard":
     st.title("📊 Financial Overview")
