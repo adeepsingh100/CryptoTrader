@@ -1,7 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-import numpy as np  # ✨ NEW: Required for Institutional ADX Calculation
+import numpy as np
 import json
 import time
 import hmac
@@ -233,7 +233,7 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. THE INSTITUTIONAL ENGINE (v62)
+# 3. THE INSTITUTIONAL ENGINE (v63)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -252,8 +252,7 @@ class GlobalBotEngine:
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.auto_top_n = 0 
         
-        self.max_budget = 500.0
-        self.trade_amount = 125.0
+        self.max_budget = 1000.0
         self.candle_interval = "15m"  
         
         self.exchange_fee_pct = 0.5 
@@ -287,7 +286,7 @@ class GlobalBotEngine:
         if len(self.trade_log) > 100: self.trade_log.pop()
         gs_manager.append_log(log_entry)
 
-    def start(self, candidate_str, auto_top_n, max_budget, trade_amount, exchange_fee_pct, tds_pct, candle_interval):
+    def start(self, candidate_str, auto_top_n, max_budget, exchange_fee_pct, tds_pct, candle_interval):
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
@@ -297,7 +296,6 @@ class GlobalBotEngine:
                 self.candidates = raw_coins if raw_coins else ["BTC", "ETH", "SOL", "XRP", "DOGE"]
             
             self.max_budget = max_budget
-            self.trade_amount = trade_amount
             self.exchange_fee_pct = exchange_fee_pct
             self.tds_pct = tds_pct
             self.candle_interval = candle_interval
@@ -329,10 +327,9 @@ class GlobalBotEngine:
         df['high'] = df['high'].astype(float)
         df['low'] = df['low'].astype(float)
         df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float) # ✨ Fetch Volume Data
+        df['volume'] = df['volume'].astype(float)
         df = df.sort_values(by='time', ascending=True)
 
-        # ✨ Volume SMA (Filter #2)
         df['Vol_SMA_20'] = df['volume'].rolling(window=20).mean()
 
         df['prev_close'] = df['close'].shift(1)
@@ -342,7 +339,6 @@ class GlobalBotEngine:
         df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
         df['ATR'] = df['tr'].rolling(window=14).mean()
         
-        # ✨ ADX Trend Strength Calculator (Filter #1)
         df['up_move'] = df['high'].diff()
         df['down_move'] = df['low'].shift(1) - df['low']
         df['+dm'] = np.where((df['up_move'] > df['down_move']) & (df['up_move'] > 0), df['up_move'], 0.0)
@@ -606,9 +602,12 @@ class GlobalBotEngine:
                 except Exception as e:
                     pass
 
-        # 2. Scanning New Entry Candidates (Institutional Filters)
+        # 2. Scanning New Entry Candidates (DYNAMIC ALLOCATOR)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
-        if (current_invested + self.trade_amount) <= self.max_budget:
+        available_budget = self.max_budget - current_invested
+        
+        # Only scan if we have at least ₹110 available to meet exchange minimums
+        if available_budget >= 110.0:
             best_candidate_coin = None
             best_candidate_market = None
             best_candidate_price = 0
@@ -651,7 +650,6 @@ class GlobalBotEngine:
                         lower_bb_15m = df_15m['Lower_BB'].iloc[-1]
                         latest_atr_15m = df_15m['ATR'].iloc[-1]
                         
-                        # ✨ Institutional Filter Gate
                         latest_adx = df_15m['ADX'].iloc[-1]
                         latest_vol = df_15m['volume'].iloc[-1]
                         latest_vol_sma = df_15m['Vol_SMA_20'].iloc[-1]
@@ -707,11 +705,19 @@ class GlobalBotEngine:
                     if action == "BUY":
                         precision = self.market_precision.get(best_candidate_market, 5)
                         multiplier = 10 ** precision
-                        raw_crypto = self.trade_amount / best_candidate_price
                         
-                        buy_crypto_amount = math.ceil(raw_crypto * multiplier) / multiplier
+                        # ✨ DYNAMIC ALLOCATION: Use 100% of the available budget (or available wallet INR)
+                        usable_cash = min(available_budget, self.inr_balance)
+                        target_cost_excluding_fees = usable_cash / self.buy_fee_multiplier
+                        
+                        raw_crypto = target_cost_excluding_fees / best_candidate_price
+                        
+                        # Floor the crypto amount so we strictly do not exceed the available max budget
+                        buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
+                        
                         min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
-                        if buy_crypto_amount < min_required_qty: buy_crypto_amount = min_required_qty
+                        if buy_crypto_amount < min_required_qty: 
+                            buy_crypto_amount = min_required_qty
                             
                         actual_cost = buy_crypto_amount * best_candidate_price
                         if actual_cost < 105.0:
@@ -721,10 +727,10 @@ class GlobalBotEngine:
                             
                         total_invested_with_fees = actual_cost * self.buy_fee_multiplier
 
-                        if total_invested_with_fees > (self.trade_amount + 15.0):
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Exchange min qty requires ₹{total_invested_with_fees:.2f}, exceeding your limit.", "Limit Enforced")
-                        elif total_invested_with_fees > self.inr_balance:
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient INR Balance.", "Failed")
+                        if total_invested_with_fees > self.inr_balance:
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient real INR Balance in wallet.", "Failed")
+                        elif total_invested_with_fees > (available_budget + 15.0): # 15rs rounding tolerance
+                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Exchange min qty exceeds your remaining budget (₹{available_budget:.2f}).", "Limit Enforced")
                         else:
                             formatted_qty = f"{buy_crypto_amount:.{precision}f}"
                             order_body = {
@@ -734,7 +740,6 @@ class GlobalBotEngine:
                             }
                             res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
                             if "orders" in res or "id" in res:
-                                # ✨ Institutional RRR: Force minimum +3.0% Net Profit target, swing up to 4x ATR
                                 breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
                                 min_net_profit_tp = breakeven_price * 1.030 
                                 
@@ -749,7 +754,7 @@ class GlobalBotEngine:
                                     "invested": total_invested_with_fees, "tp_price": target_tp, "sl_price": target_sl,
                                     "buy_time": time.time()
                                 }
-                                self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
+                                self.log_trade("ALL-IN BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
                             else:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
@@ -758,7 +763,6 @@ class GlobalBotEngine:
                 except Exception as e:
                     pass
             else:
-                # Log the specific reason coins failed the pre-filters
                 if rejected_by_macro:
                     coins = f"{len(rejected_by_macro)} assets" if len(rejected_by_macro) > 4 else ", ".join(rejected_by_macro)
                     self.log_trade("MACRO REJECT", "ALL", "0", "₹0.00", f"Assets {coins} are trading below 1H 200 EMA.", "Filter Active")
@@ -771,12 +775,12 @@ class GlobalBotEngine:
                 else:
                     self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No valid trade setups found in current market structure.", "Standby")
 
-# Cache Buster v62
+# Cache Buster v63
 @st.cache_resource
-def get_bot_engine_v62():
+def get_bot_engine_v63():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v62()
+bot = get_bot_engine_v63()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -824,7 +828,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 62.0 (Institutional ADX/Vol Strategy)")
+st.sidebar.caption("Version 63.0 (Dynamic All-In Allocator)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -861,23 +865,22 @@ if page == "⚙️ Bot Engine & Settings":
             timeframes, index=default_idx
         )
 
-    st.markdown("<br>#### 💰 Capital & Tax Shield Settings", unsafe_allow_html=True)
+    st.markdown("<br>#### 💰 Capital Allocation & Tax Shield", unsafe_allow_html=True)
     colA, colB, colC = st.columns(3)
     with colA:
-        max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=200.0, value=float(bot.max_budget), step=100.0)
+        max_bud = st.number_input("Max Portfolio Allocation (INR)", min_value=150.0, value=float(bot.max_budget), step=100.0)
     with colB:
-        trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
-    with colC:
         exchange_fee_pct = st.number_input("Exchange Fee % (e.g. 0.5)", min_value=0.0, value=float(bot.exchange_fee_pct), step=0.1)
+    with colC:
         tds_pct = st.number_input("Govt TDS % (e.g. 1.0)", min_value=0.0, value=float(bot.tds_pct), step=0.1)
         
-    st.info(f"🛡️ **Tax Shield Active:** The bot automatically factors in {exchange_fee_pct}% Maker/Taker fees + 18% GST + {tds_pct}% TDS. It calculates absolute exact net cash-in-hand and explicitly prevents taking profits if the margin lands in the Tax Dead Zone.", icon="🇮🇳")
+    st.info(f"🛡️ **Dynamic Allocator Active:** The bot will dynamically invest up to **₹{max_bud:.2f}** into the best confirmed setup. It factors {exchange_fee_pct}% fees + 18% GST + {tds_pct}% TDS and ensures a minimum **+3.0% net cash profit** before exiting.", icon="🇮🇳")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(candidate_input, top_n, max_bud, trade_amt, exchange_fee_pct, tds_pct, candle_interval)
+            bot.start(candidate_input, top_n, max_bud, exchange_fee_pct, tds_pct, candle_interval)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
