@@ -234,7 +234,7 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE (v60)
+# 3. DUAL TIMEFRAME SPLIT ENGINE (v61)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -316,7 +316,8 @@ class GlobalBotEngine:
 
     def fetch_candle_data(self, coin, interval=None, limit=40):
         market_name = f"{coin}INR"
-        pair = self.market_pair_string.get(market_name, f"B-{coin}_INR")
+        # ✨ FIX: The fallback strictly forces "I-" natively for INR pairings to block USD data mixing
+        pair = self.market_pair_string.get(market_name, f"I-{coin}_INR")
         actual_interval = interval or self.candle_interval
         url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={actual_interval}&limit={limit}"
         data = coindcx_get_with_retry(url, max_retries=3, timeout=20)
@@ -426,7 +427,6 @@ class GlobalBotEngine:
                     if b['currency'] == 'INR': 
                         self.inr_balance = avail_bal 
 
-        # ✨ COMPLETELY REPLACED ALL timeout=10 CALLS
         markets = coindcx_get_with_retry("https://api.coindcx.com/exchange/v1/markets_details", max_retries=3, timeout=20)
         if not markets: return False
         
@@ -443,11 +443,13 @@ class GlobalBotEngine:
             
             if self.auto_top_n > 0 and len(self.candidates) == 0:
                 inr_markets = []
+                # ✨ FIX: Expanded blacklist to aggressively block 12 USD Stablecoins from Auto-Scan
+                stablecoins = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'BUSD', 'USDD', 'PYUSD', 'USDE', 'FRAX', 'USDP', 'CUSD'}
                 for t in tickers:
                     market = t.get('market', '')
                     if market.endswith('INR'):
                         base_coin = market[:-3]
-                        if base_coin not in ['USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI']:
+                        if base_coin not in stablecoins:
                             try:
                                 vol = float(t.get('volume', 0))
                                 price = float(t.get('last_price', 0))
@@ -546,6 +548,7 @@ class GlobalBotEngine:
                 self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
 
     def _scan_for_entries(self):
+        # 1. Active Positions Exit Filter
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
@@ -590,6 +593,7 @@ class GlobalBotEngine:
                 except Exception as e:
                     pass
 
+        # 2. Scanning New Entry Candidates
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         if (current_invested + self.trade_amount) <= self.max_budget:
             best_candidate_coin = None
@@ -733,12 +737,12 @@ class GlobalBotEngine:
                 else:
                     self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No valid trade setups found in current market structure.", "Standby")
 
-# Cache Buster v60
+# Cache Buster v61
 @st.cache_resource
-def get_bot_engine_v60():
+def get_bot_engine_v61():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v60()
+bot = get_bot_engine_v61()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -786,7 +790,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 60.0 (Global Timeout Purge)")
+st.sidebar.caption("Version 61.0 (Native INR Chart Fix)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -942,15 +946,14 @@ elif page == "📊 Live Dashboard":
         live_inr = bot.inr_balance
         live_prices = bot.last_prices.copy()
         
-        # ✨ FIX: Dashboard dashboard API calls strictly use the resilient wrapper
         balance_body = {"timestamp": int(round(time.time() * 1000))}
-        balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body, max_retries=2, timeout=20)
+        balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body, max_retries=1, timeout=10)
         if isinstance(balances_data, list):
             for b in balances_data:
                 if b.get('currency') == 'INR':
                     live_inr = float(b.get('balance', 0))
                     
-        tickers = coindcx_get_with_retry("https://api.coindcx.com/exchange/ticker", max_retries=2, timeout=20)
+        tickers = coindcx_get_with_retry("https://api.coindcx.com/exchange/ticker", max_retries=1, timeout=10)
         if isinstance(tickers, list):
             for t in tickers:
                 if 'market' in t: live_prices[t['market']] = float(t['last_price'])
