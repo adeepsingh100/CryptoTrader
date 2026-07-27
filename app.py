@@ -203,7 +203,7 @@ def log_api_failure(endpoint, error_msg):
         gs_manager.append_api_error(ts, endpoint, error_msg)
 
 # ==========================================
-# 3. DUAL TIMEFRAME SPLIT ENGINE (v54)
+# 3. DUAL TIMEFRAME SPLIT ENGINE (v55)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -221,6 +221,7 @@ class GlobalBotEngine:
         
         self.candidates = ["BTC", "ETH", "SOL", "XRP", "DOGE"]
         self.auto_top_n = 0 
+        self.enable_bear_shield = True
         
         self.max_budget = 500.0
         self.trade_amount = 125.0
@@ -380,12 +381,19 @@ class GlobalBotEngine:
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body)
         actual_balances = {}
+        
         if isinstance(balances_data, list):
             for b in balances_data:
-                bal = float(b.get('balance', 0))
-                if bal > 0:
-                    actual_balances[b['currency']] = bal
-                    if b['currency'] == 'INR': self.inr_balance = bal
+                # ✨ FIX: Extract both available and locked balances (prevent disappearing coins)
+                avail_bal = float(b.get('balance', 0))
+                locked_bal = float(b.get('locked_balance', 0))
+                total_bal = avail_bal + locked_bal
+                
+                if total_bal > 0:
+                    actual_balances[b['currency']] = total_bal
+                    if b['currency'] == 'INR': 
+                        # For INR, we only care about FREE cash to buy new things
+                        self.inr_balance = avail_bal 
 
         try:
             markets_res = requests.get("https://api.coindcx.com/exchange/v1/markets_details", timeout=10)
@@ -433,11 +441,19 @@ class GlobalBotEngine:
                             "entry_price": curr_price,
                             "invested": invested_with_fees,
                             "tp_price": curr_price * 1.05, 
-                            "sl_price": curr_price * 0.95
+                            "sl_price": curr_price * 0.95,
+                            "buy_time": time.time() - 200 # Legacy sync gets instantly deletable
                         }
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{invested_with_fees:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
+        # ✨ FIX: API Lag Deletion Protection
         for coin in list(self.active_positions.keys()):
+            pos = self.active_positions[coin]
+            
+            # Allow 3 minutes for limit orders to fill and exchange ledgers to update
+            if time.time() - pos.get('buy_time', 0) < 180:
+                continue
+                
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
                 self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
                 del self.active_positions[coin]
@@ -661,7 +677,8 @@ class GlobalBotEngine:
                                 
                                 self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount, "entry_price": best_candidate_price,
-                                    "invested": total_invested_with_fees, "tp_price": target_tp, "sl_price": target_sl
+                                    "invested": total_invested_with_fees, "tp_price": target_tp, "sl_price": target_sl,
+                                    "buy_time": time.time() # ✨ FIX: Timestamp added for the 3-minute grace period
                                 }
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
                             else:
@@ -673,12 +690,12 @@ class GlobalBotEngine:
                     log_api_failure("groq_chat_completion_buy", str(e))
                     self.log_trade("AI ERROR", best_candidate_coin, "0", "₹0.00", f"AI Decision Error: {str(e)}", "Bypassed")
 
-# Cache Buster v54
+# Cache Buster v55
 @st.cache_resource
-def get_bot_engine_v54():
+def get_bot_engine_v55():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v54()
+bot = get_bot_engine_v55()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -723,7 +740,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 54.0 (Removed Liquidate Shield)")
+st.sidebar.caption("Version 55.0 (API Lag Deletion Protection)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
