@@ -553,7 +553,7 @@ class GlobalBotEngine:
                         Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short concise sentence"}"""
                         
                         response = client.chat.completions.create(
-                            model="openai/gpt-oss-120b",
+                            model="llama-3.3-70b-versatile", # ✨ UPDATED TO LLAMA 3.3 70B
                             messages=[
                                 {"role": "system", "content": sell_prompt},
                                 {"role": "user", "content": f"Held asset {market} (15m candles):\n\n{df_str}"}
@@ -712,7 +712,7 @@ class GlobalBotEngine:
                 
                 try:
                     response = client.chat.completions.create(
-                        model="openai/gpt-oss-120b",
+                        model="llama-3.3-70b-versatile", # ✨ UPDATED TO LLAMA 3.3 70B
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": mtf_user_prompt}
@@ -781,12 +781,12 @@ class GlobalBotEngine:
         else:
             self.log_trade("BUDGET LOCK", "PORTFOLIO", "ALL", f"₹{current_invested:.2f}", "Maximum portfolio budget reached. Awaiting sell event.", "Budget Full")
 
-# Cache Buster v49
+# Cache Buster v50
 @st.cache_resource
-def get_bot_engine_v49():
+def get_bot_engine_v50():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v49()
+bot = get_bot_engine_v50()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -849,7 +849,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 AUTOPILOT STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 49.0 (Dual Timeframe 1H+15M AI Analysis)")
+st.sidebar.caption("Version 50.0 (Llama 3.3 70B Integration)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -901,7 +901,7 @@ if page == "⚙️ Bot Engine & Settings":
     with colB:
         trade_amt = st.number_input("Position Size Per Asset (INR)", min_value=120.0, value=float(bot.trade_amount), step=10.0)
         
-    st.info("🧠 **Dual Timeframe AI Analysis:** The Groq AI model now evaluates both **1-Hour** (Macro Trend) and **15-Minute** (Precision Entry) charts simultaneously before authorizing any trade.", icon="📊")
+    st.info("🧠 **Dual Timeframe AI Analysis:** The Groq Llama 3.3 70B model now evaluates both **1-Hour** (Macro Trend) and **15-Minute** (Precision Entry) charts simultaneously before authorizing any trade.", icon="📊")
     st.info(f"⏱️ **Clock-Locking Active:** Timer is locked to trigger exactly on **{candle_interval}** candle closes (+1.5s latency buffer).", icon="🔒")
     st.markdown('</div>', unsafe_allow_html=True)
 
