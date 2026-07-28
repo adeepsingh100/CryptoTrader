@@ -231,7 +231,7 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. APEX SNIPER ENGINE (v64)
+# 3. DUAL-AGENT APEX ENGINE (v65)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -476,12 +476,11 @@ class GlobalBotEngine:
                         invested_with_fees = value * self.buy_fee_multiplier
                         breakeven = curr_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
                         
-                        # ✨ NEW TSL Data Structure
                         self.active_positions[coin] = {
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
                             "invested": invested_with_fees,
-                            "sl_price": curr_price * 0.95, # Sync Fallback
+                            "sl_price": curr_price * 0.95,
                             "peak_price": curr_price,
                             "atr": curr_price * 0.01,
                             "breakeven_price": breakeven,
@@ -509,14 +508,10 @@ class GlobalBotEngine:
             
             pos = self.active_positions[coin]
             
-            # ✨ Update Peak Price for Trailing Stop Loss
             if curr_price > pos['peak_price']:
                 pos['peak_price'] = curr_price
                 
-            # ✨ Calculate Mathematical TSL Floor
             dynamic_sl = pos['peak_price'] - (1.5 * pos['atr'])
-            
-            # ✨ Risk-Free Pivot Logic (Triggered at Breakeven + 1.5%)
             pivot_threshold = pos['breakeven_price'] * 1.015
             
             if not pos['risk_free_active'] and curr_price > pivot_threshold:
@@ -524,13 +519,11 @@ class GlobalBotEngine:
                 self.log_trade("RISK-FREE PIVOT", coin, "0", f"₹{curr_price:.2f}", "Price cleared tax threshold. Stop-Loss mechanically moved to Guaranteed Profit.", "Shield Up")
 
             if pos['risk_free_active']:
-                # SL is strictly floored at Breakeven + 0.2% to guarantee absolute profit forever
                 guaranteed_sl = pos['breakeven_price'] * 1.002
                 pos['sl_price'] = max(pos['sl_price'], dynamic_sl, guaranteed_sl)
             else:
                 pos['sl_price'] = max(pos['sl_price'], dynamic_sl)
 
-            # ✨ Trigger Sell ONLY on TSL Hit
             if curr_price <= pos['sl_price']:
                 reason = "Trailing Stop Loss Hit (Secured Max Profit)." if pos['risk_free_active'] else "Initial Stop Loss Hit (Cut Loss)."
                 self._execute_sell(coin, "TSL EXIT", reason)
@@ -575,11 +568,55 @@ class GlobalBotEngine:
                 self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
 
     def _scan_for_entries(self):
-        # 1. Scanning New Entry Candidates (DYNAMIC ALLOCATOR)
+        # Active Positions Pre-Filter (Kept as fast Llama 3.3 for rapid exit validation if needed)
+        for coin in list(self.active_positions.keys()):
+            market = f"{coin}INR"
+            curr_price = self.last_prices.get(market)
+            if not curr_price: continue
+            
+            pos = self.active_positions[coin]
+            breakeven_price = pos['entry_price'] * (self.buy_fee_multiplier / self.sell_fee_multiplier)
+            
+            candles_15m = self.fetch_candle_data(coin, interval="15m")
+            time.sleep(0.4) 
+            
+            if candles_15m:
+                try:
+                    df = self.process_df_indicators(candles_15m)
+                    latest_rsi = df['RSI'].iloc[-1]
+                    
+                    if latest_rsi > 58 or curr_price >= df['Upper_BB'].iloc[-1]:
+                        df['time'] = pd.to_datetime(df['time'], unit='ms')
+                        df_str = df[['time', 'close', 'RSI', 'MACD_Hist', 'Upper_BB']].tail(8).to_string(index=False)
+                        
+                        client = Groq(api_key=GROQ_API_KEY)
+                        sell_prompt = """You are an elite quantitative crypto hedge fund manager. Output 'SELL' if price is overextended near Upper_BB and momentum is exhausting. Output 'HOLD' if the trend remains strong upwards. Respond ONLY in JSON: {"action": "SELL" or "HOLD", "reasoning": "1 short sentence"}"""
+                        
+                        response = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile", 
+                            messages=[
+                                {"role": "system", "content": sell_prompt},
+                                {"role": "user", "content": f"Held asset {market} (15m candles):\n\n{df_str}"}
+                            ],
+                            response_format={"type": "json_object"}, temperature=0.1
+                        )
+                        decision_data = json.loads(response.choices[0].message.content)
+                        if decision_data.get("action", "").upper() == "SELL":
+                            if pos['entry_price'] < curr_price < breakeven_price:
+                                self.log_trade("AI OVERRIDE", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"AI Sell blocked: Profit is in Dead Zone.", "Tax Shield")
+                            else:
+                                self._execute_sell(coin, "PRO AI SELL", decision_data.get("reasoning", "AI detected peak exhaustion."))
+                        else:
+                            self.log_trade("AI HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", decision_data.get("reasoning", "AI riding trend."), "Trailing Peak")
+                    else:
+                        self.log_trade("LOCAL HOLD (ACTIVE)", coin, f"{pos['qty']:.4f}", f"₹{(pos['qty']*curr_price):.2f}", f"RSI is {latest_rsi:.1f}. Waiting for momentum.", "Trailing")
+                except Exception as e:
+                    pass
+
+        # 2. Scanning New Entry Candidates (DYNAMIC ALLOCATOR WITH DUAL-AGENT PIPELINE)
         current_invested = sum(p['invested'] for p in self.active_positions.values())
         available_budget = self.max_budget - current_invested
         
-        # Only scan if we have at least ₹110 available to meet exchange minimums
         if available_budget >= 110.0:
             best_candidate_coin = None
             best_candidate_market = None
@@ -623,24 +660,21 @@ class GlobalBotEngine:
                         lower_bb_15m = df_15m['Lower_BB'].iloc[-1]
                         latest_atr_15m = df_15m['ATR'].iloc[-1]
                         
-                        # ✨ INSTITUTIONAL MATHEMATICAL GATES
                         latest_adx = df_15m['ADX'].iloc[-1]
                         latest_vol = df_15m['volume'].iloc[-1]
                         latest_vol_sma = df_15m['Vol_SMA_20'].iloc[-1]
                         
-                        # ADX MUST be > 25 (Explosive Momentum Only)
                         if pd.isna(latest_adx) or latest_adx < 25.0:
                             rejected_by_adx.append(coin)
                             continue
                             
-                        # VOLUME MUST be 1.5x greater than average (Whale Participation)
                         if latest_vol < (1.5 * latest_vol_sma):
                             rejected_by_vol.append(coin)
                             continue
                         
                         df_15m_str = df_15m[['time', 'close', 'volume', 'MACD_Hist', 'Upper_BB', 'ADX']].tail(8).to_string(index=False)
                         
-                        # If it passes the gates, score it based on breakout power
+                        bb_distance_pct = ((latest_close_15m - lower_bb_15m) / lower_bb_15m) * 100
                         setup_score = latest_adx + (latest_vol / latest_vol_sma)
 
                         if setup_score > best_setup_score:
@@ -654,31 +688,48 @@ class GlobalBotEngine:
                     except Exception as e:
                         continue
 
+            # ✨ DUAL-AGENT PIPELINE EXECUTION
             if best_candidate_coin and best_candidate_1h_str and best_candidate_15m_str:
                 client = Groq(api_key=GROQ_API_KEY)
-                # ✨ NEW RUTHLESS AI PROMPT
-                system_prompt = """You are an elite quantitative hedge fund algorithm. Your only goal is asymmetric breakout trading. The macro trend, ADX (>25), and Volume Surge (>1.5x) filters have already mathematically passed. Your job is to verify price action.
-                Look for:
-                1. Explosive Bollinger Band expansions.
-                2. Aggressive wick rejections off local support.
-                3. Institutional momentum stepping in.
-                Output 'BUY' ONLY if the chart confirms a violent, highly probable breakout. Otherwise, output 'HOLD'.
-                Respond ONLY in JSON format: {"action": "BUY" or "HOLD", "reasoning": "1 short concise sentence explaining the price action"}"""
-                
                 mtf_user_prompt = f"Verify Asymmetric Breakout for {best_candidate_market}:\n=== 1-HOUR CHART ===\n{best_candidate_1h_str}\n=== 15-MINUTE CHART ===\n{best_candidate_15m_str}"
                 
                 try:
-                    response = client.chat.completions.create(
+                    # AGENT 1: The Analyst (DeepSeek R1)
+                    analyst_prompt = """You are an elite quantitative researcher. Analyze this MTF chart data for a potential breakout. 
+                    The math filters (ADX > 25, Volume > 1.5x) have already passed. 
+                    Identify if this is a genuine institutional breakout or a bull trap based on wicks, Bollinger Band expansion, and momentum.
+                    Write a brief, brutal, and highly logical assessment. Do not output JSON."""
+                    
+                    analyst_res = client.chat.completions.create(
+                        model="deepseek-r1-distill-llama-70b",
+                        messages=[
+                            {"role": "system", "content": analyst_prompt},
+                            {"role": "user", "content": mtf_user_prompt}
+                        ],
+                        temperature=0.3
+                    )
+                    analyst_report = analyst_res.choices[0].message.content
+                    
+                    # AGENT 2: The Executioner (Llama 3.3)
+                    exec_system_prompt = """You are an elite hedge fund execution bot. Read the Analyst's Report and the raw data below. 
+                    If the analyst confirms a high-probability, genuine breakout with strong momentum, output 'BUY'.
+                    If the analyst suspects a trap, chop, weak price action, or fakeout, output 'HOLD'.
+                    Respond ONLY in JSON format: {"action": "BUY" or "HOLD", "reasoning": "1 concise sentence summarizing the analyst's conclusion"}"""
+
+                    exec_user_prompt = f"=== ANALYST REPORT ===\n{analyst_report}\n\n=== RAW DATA ===\n{mtf_user_prompt}"
+                    
+                    exec_res = client.chat.completions.create(
                         model="llama-3.3-70b-versatile",
                         messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": mtf_user_prompt}
+                            {"role": "system", "content": exec_system_prompt},
+                            {"role": "user", "content": exec_user_prompt}
                         ],
                         response_format={"type": "json_object"}, temperature=0.1
                     )
-                    decision_data = json.loads(response.choices[0].message.content)
+                    decision_data = json.loads(exec_res.choices[0].message.content)
+                    
                     action = decision_data.get("action", "HOLD").upper()
-                    reasoning = decision_data.get("reasoning", "AI evaluated breakout structure.")
+                    reasoning = decision_data.get("reasoning", "Dual-Agent executed evaluation.")
 
                     if action == "BUY":
                         precision = self.market_precision.get(best_candidate_market, 5)
@@ -719,7 +770,6 @@ class GlobalBotEngine:
                                 breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
                                 initial_sl = best_candidate_price - (1.5 * best_atr)
                                 
-                                # ✨ Store New TSL Position Object
                                 self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount, 
                                     "entry_price": best_candidate_price,
@@ -736,7 +786,7 @@ class GlobalBotEngine:
                                 err = res.get("error", "API Error")
                                 self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                     else:
-                        self.log_trade("AI HOLD (ENTRY)", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "Breakout Denied")
+                        self.log_trade("AI HOLD (ENTRY)", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "DeepSeek Denied")
                 except Exception as e:
                     pass
             else:
@@ -752,12 +802,12 @@ class GlobalBotEngine:
                 else:
                     self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No explosive setups found.", "Standby")
 
-# Cache Buster v64
+# Cache Buster v65
 @st.cache_resource
-def get_bot_engine_v64():
+def get_bot_engine_v65():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v64()
+bot = get_bot_engine_v65()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -805,7 +855,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 ENGINE STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 64.0 (Risk-Free TSL Mechanics)")
+st.sidebar.caption("Version 65.0 (Dual-Agent DeepSeek + Llama)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -851,7 +901,7 @@ if page == "⚙️ Bot Engine & Settings":
     with colC:
         tds_pct = st.number_input("Govt TDS % (e.g. 1.0)", min_value=0.0, value=float(bot.tds_pct), step=0.1)
         
-    st.info(f"🛡️ **Apex Shield Active:** The bot will dynamically size up to **₹{max_bud:.2f}** into the best confirmed breakout. It mechanically moves the Stop-Loss above breakeven once profits clear the {exchange_fee_pct}% Fee and {tds_pct}% TDS tax barrier.", icon="🎯")
+    st.info(f"🛡️ **Dual-Agent Shield Active:** DeepSeek R1 acts as the analyst, Llama 3.3 acts as the executioner. The bot will dynamically size up to **₹{max_bud:.2f}** into the best confirmed breakout.", icon="🎯")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
@@ -1098,7 +1148,6 @@ elif page == "📊 Live Dashboard":
                 net_pnl = net_live_value - pos['invested']
                 net_pnl_pct = (net_pnl / pos['invested']) * 100
                 
-                # Dynamic UI Display based on Risk-Free Status
                 shield_status = "🟢 ACTIVE" if pos.get('risk_free_active', False) else "🔴 WAITING"
                 
                 pos_data.append({
