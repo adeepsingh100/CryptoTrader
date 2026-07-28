@@ -9,7 +9,6 @@ import hashlib
 import requests
 import math
 import threading
-from groq import Groq
 from datetime import datetime, timezone, timedelta
 
 # Google Sheets Libraries
@@ -22,11 +21,9 @@ from oauth2client.service_account import ServiceAccountCredentials
 try:
     API_KEY = st.secrets["COINDCX_API_KEY"]
     API_SECRET = st.secrets["COINDCX_API_SECRET"]
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except Exception:
     API_KEY = "YOUR_COINDCX_API_KEY_HERE"
     API_SECRET = "YOUR_COINDCX_API_SECRET_HERE"
-    GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
 
 # Anti-Spam Log Throttler
 _last_error_log_times = {}
@@ -96,6 +93,14 @@ def coindcx_get_with_retry(url, max_retries=3, timeout=20):
                 continue
             log_api_failure(url, str(e))
             return None
+
+def order_succeeded(res):
+    if not isinstance(res, dict) or "error" in res:
+        return False
+    if res.get("id"):
+        return True
+    orders = res.get("orders")
+    return bool(orders)
 
 # ==========================================
 # 2. CACHED & RELIABLE GOOGLE SHEETS MANAGER
@@ -230,7 +235,7 @@ class GoogleSheetsManager:
 gs_manager = GoogleSheetsManager()
 
 # ==========================================
-# 3. PURE PYTHON SWING ENGINE (vFinal)
+# 3. PURE PYTHON QUANT ENGINE (vFinal)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -254,6 +259,15 @@ class GlobalBotEngine:
         
         self.exchange_fee_pct = 0.5 
         self.tds_pct = 1.0 
+
+        # --- Risk management ---
+        self.max_position_pct = 100.0   
+        self.daily_loss_limit_pct = 0.0  
+        self._daily_loss_date = None
+        self._daily_realized_loss = 0.0
+        self._kill_switch_active = False
+        self._atr_refresh_counter = {}   
+        self._top_n_last_refresh = 0     
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -274,6 +288,24 @@ class GlobalBotEngine:
     def sell_fee_multiplier(self):
         return 1 - (self.exchange_fee_pct / 100.0 * 1.18) - (self.tds_pct / 100.0)
 
+    def _check_circuit_breaker(self):
+        now = time.time()
+        twenty_four_hours_ago = now - 86400
+        daily_loss = 0.0
+        for trade in self.completed_trades:
+            if trade.get("timestamp", 0) >= twenty_four_hours_ago:
+                pnl = float(trade.get("pnl", 0.0))
+                if pnl < 0:
+                    daily_loss += abs(pnl)
+        
+        max_allowed_loss = self.max_budget * (self.daily_loss_limit_pct / 100.0)
+        
+        if daily_loss >= max_allowed_loss and self.daily_loss_limit_pct > 0:
+            self.log_trade("SYSTEM STOP", "ALL", "0", "₹0.00", f"CIRCUIT BREAKER: 24h loss (₹{daily_loss:.2f}) exceeded {self.daily_loss_limit_pct}% limit.", "Emergency")
+            self.stop()
+            return True
+        return False
+
     def log_trade(self, action, coin, qty, value, reason, status):
         log_entry = {
             "timestamp": time.time(), "Action": action, "Coin": coin,
@@ -283,7 +315,8 @@ class GlobalBotEngine:
         if len(self.trade_log) > 100: self.trade_log.pop()
         gs_manager.append_log(log_entry)
 
-    def start(self, candidate_str, auto_top_n, max_budget, exchange_fee_pct, tds_pct, candle_interval):
+    def start(self, candidate_str, auto_top_n, max_budget, exchange_fee_pct, tds_pct, candle_interval,
+              max_position_pct=100.0, daily_loss_limit_pct=0.0):
         if not self.is_running:
             self.auto_top_n = auto_top_n
             if self.auto_top_n > 0:
@@ -296,6 +329,11 @@ class GlobalBotEngine:
             self.exchange_fee_pct = exchange_fee_pct
             self.tds_pct = tds_pct
             self.candle_interval = candle_interval
+            self.max_position_pct = max_position_pct
+            self.daily_loss_limit_pct = daily_loss_limit_pct
+            self._kill_switch_active = False
+            self._daily_realized_loss = 0.0
+            self._daily_loss_date = None
             
             self.is_running = True
             self.thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -308,7 +346,8 @@ class GlobalBotEngine:
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
         return interval_map.get(self.candle_interval, 900)
 
-    def fetch_candle_data(self, coin, interval=None, limit=50):
+    # ✨ VITAL FIX: Fetch 200 candles minimum for mathematically accurate ADX/EMA burn-in
+    def fetch_candle_data(self, coin, interval=None, limit=200):
         market_name = f"{coin}INR"
         pair = self.market_pair_string.get(market_name, f"I-{coin}_INR")
         actual_interval = interval or self.candle_interval
@@ -326,6 +365,14 @@ class GlobalBotEngine:
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         df = df.sort_values(by='time', ascending=True)
+
+        # ✨ VITAL FIX: Drop the active, unclosed candle. 
+        # All indicators and volume will now strictly calculate on finalized data.
+        df = df.iloc[:-1].copy()
+        
+        # If dropping the last row makes it too small, exit safely
+        if len(df) < 15:
+            return df
 
         df['Vol_SMA_20'] = df['volume'].rolling(window=20).mean()
 
@@ -375,12 +422,15 @@ class GlobalBotEngine:
                 return latest_close > latest_ema 
             except Exception:
                 pass
-        return True 
+        return False
 
     def _run_loop(self):
         last_candle_block = 0
         while self.is_running:
             try:
+                if self._check_circuit_breaker():
+                    break
+                    
                 success = self._fetch_market_state()
                 self.api_is_down = not success
                 
@@ -440,7 +490,8 @@ class GlobalBotEngine:
         if isinstance(tickers, list):
             self.last_prices = {t['market']: float(t['last_price']) for t in tickers if 'market' in t}
             
-            if self.auto_top_n > 0 and len(self.candidates) == 0:
+            top_n_stale = (time.time() - getattr(self, "_top_n_last_refresh", 0)) > 21600
+            if self.auto_top_n > 0 and (len(self.candidates) == 0 or top_n_stale):
                 inr_markets = []
                 stablecoins = {'USDT', 'USDC', 'FDUSD', 'TUSD', 'DAI', 'BUSD', 'USDD', 'PYUSD', 'USDE', 'FRAX', 'USDP', 'CUSD'}
                 for t in tickers:
@@ -455,6 +506,7 @@ class GlobalBotEngine:
                             except Exception: pass
                 inr_markets.sort(key=lambda x: x[1], reverse=True)
                 self.candidates = [m[0] for m in inr_markets[:self.auto_top_n]]
+                self._top_n_last_refresh = time.time()
                 self.log_trade("SYSTEM", "AUTO-SCAN", str(self.auto_top_n), "₹0.00", f"Auto-selected top {self.auto_top_n} volatile coins.", "Info")
 
         for coin in self.candidates:
@@ -471,42 +523,60 @@ class GlobalBotEngine:
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
                             "invested": invested_with_fees,
-                            "sl_price": curr_price * 0.90, # 10% default loose SL until calculated
+                            "sl_price": curr_price * 0.90, 
                             "peak_price": curr_price,
                             "atr": curr_price * 0.02,
                             "breakeven_price": breakeven,
                             "risk_free_active": False,
+                            "sync_misses": 0,
                             "buy_time": time.time() - 200
                         }
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{invested_with_fees:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
+        # ✨ VITAL FIX: 3-Strike Memory Protection against API Sync Glitches
         for coin in list(self.active_positions.keys()):
             pos = self.active_positions[coin]
             if time.time() - pos.get('buy_time', 0) < 180:
                 continue
                 
             if coin not in actual_balances or (actual_balances[coin] * self.last_prices.get(f"{coin}INR", 0) < 50):
-                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
-                del self.active_positions[coin]
+                misses = pos.get('sync_misses', 0) + 1
+                pos['sync_misses'] = misses
+                
+                if misses >= 3:
+                    self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset missing from wallet (Verified 3x).", "Wallet Sync")
+                    del self.active_positions[coin]
+            else:
+                pos['sync_misses'] = 0
                 
         return True 
 
     def _monitor_live_exits(self):
-        # 100% PURE PYTHON EXITS. No LLM delays. Instant execution.
         for coin in list(self.active_positions.keys()):
             market = f"{coin}INR"
             curr_price = self.last_prices.get(market)
             if not curr_price: continue
             
             pos = self.active_positions[coin]
+
+            self._atr_refresh_counter[coin] = self._atr_refresh_counter.get(coin, 0) + 1
+            if self._atr_refresh_counter[coin] >= 20:
+                self._atr_refresh_counter[coin] = 0
+                try:
+                    fresh_candles = self.fetch_candle_data(coin, interval="15m", limit=30)
+                    if fresh_candles:
+                        fresh_df = self.process_df_indicators(fresh_candles)
+                        if len(fresh_df) > 0:
+                            fresh_atr = fresh_df['ATR'].iloc[-1]
+                            if not pd.isna(fresh_atr) and fresh_atr > 0:
+                                pos['atr'] = fresh_atr
+                except Exception:
+                    pass
             
             if curr_price > pos['peak_price']:
                 pos['peak_price'] = curr_price
                 
-            # Trailing Stop: 2x ATR behind the peak price
             dynamic_sl = pos['peak_price'] - (2.0 * pos['atr'])
-            
-            # The Tax Shield Pivot (Activates at +3% profit margin)
             pivot_threshold = pos['breakeven_price'] * 1.03
             
             if not pos['risk_free_active'] and curr_price > pivot_threshold:
@@ -514,7 +584,6 @@ class GlobalBotEngine:
                 self.log_trade("RISK-FREE PIVOT", coin, "0", f"₹{curr_price:.2f}", "Price cleared 3% profit margin. Stop-Loss mechanically locked above breakeven.", "Shield Up")
 
             if pos['risk_free_active']:
-                # Floor the SL at Breakeven + 0.2% so a loss is mathematically impossible
                 guaranteed_sl = pos['breakeven_price'] * 1.002
                 pos['sl_price'] = max(pos['sl_price'], dynamic_sl, guaranteed_sl)
             else:
@@ -534,45 +603,89 @@ class GlobalBotEngine:
         sell_qty = math.floor(pos['qty'] * multiplier) / multiplier
         
         gross_value = sell_qty * curr_price
+
+        if sell_qty <= 0:
+            self.log_trade("SELL SKIPPED", coin, "0", "₹0.00", "Sell quantity rounds to zero.", "Error")
+            return
+
+        formatted_qty = f"{sell_qty:.{precision}f}"
         
-        if gross_value >= 100.0:
-            formatted_qty = f"{sell_qty:.{precision}f}"
-            order_body = {
-                "side": "sell", "order_type": "limit_order", "market": market,
-                "price_per_unit": float(curr_price), "total_quantity": float(formatted_qty), 
-                "timestamp": int(round(time.time() * 1000))
+        # ✨ VITAL FIX: Pure Market Order Format (No price_per_unit allowed)
+        order_body = {
+            "side": "sell", 
+            "order_type": "market_order", 
+            "market": market,
+            "total_quantity": float(formatted_qty),
+            "timestamp": int(round(time.time() * 1000))
+        }
+        res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
+        
+        if order_succeeded(res):
+            net_received = gross_value * self.sell_fee_multiplier
+            net_profit = net_received - pos['invested']
+            net_pnl_pct = (net_profit / pos['invested']) * 100
+
+            self.realized_pnl += net_profit
+            self._track_daily_loss(net_profit)
+
+            trade_record = {
+                "timestamp": time.time(), "coin": coin, "entry_price": pos['entry_price'], "exit_price": curr_price,
+                "invested": pos['invested'], "pnl": net_profit, "pnl_pct": net_pnl_pct, "type": action_type
             }
-            res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
-            if "orders" in res or "id" in res:
-                net_received = gross_value * self.sell_fee_multiplier
-                net_profit = net_received - pos['invested']
-                net_pnl_pct = (net_profit / pos['invested']) * 100
-                
+            self.completed_trades.append(trade_record)
+            gs_manager.append_trade(trade_record)
+
+            self.log_trade("SELL", coin, formatted_qty, f"₹{net_received:.2f}", reasoning, "Success")
+            del self.active_positions[coin]
+        else:
+            err = res.get("error", "API Error")
+            if gross_value < 100.0:
+                net_profit = -pos['invested']
                 self.realized_pnl += net_profit
-                
+                self._track_daily_loss(net_profit)
                 trade_record = {
                     "timestamp": time.time(), "coin": coin, "entry_price": pos['entry_price'], "exit_price": curr_price,
-                    "invested": pos['invested'], "pnl": net_profit, "pnl_pct": net_pnl_pct, "type": action_type
+                    "invested": pos['invested'], "pnl": net_profit, "pnl_pct": -100.0, "type": "DUST WRITE-OFF"
                 }
                 self.completed_trades.append(trade_record)
                 gs_manager.append_trade(trade_record)
-                
-                self.log_trade("SELL", coin, formatted_qty, f"₹{net_received:.2f}", reasoning, "Success")
+                self.log_trade("DUST WRITE-OFF", coin, formatted_qty, f"₹{gross_value:.2f}",
+                                f"Below exchange minimum order value ({err}). Position abandoned to avoid indefinite unhedged exposure.", "Written Off")
                 del self.active_positions[coin]
             else:
-                err = res.get("error", "API Error")
                 self.log_trade("SELL FAILED", coin, formatted_qty, f"₹{gross_value:.2f}", f"Rejected: {err}", "Error")
 
+    def _track_daily_loss(self, net_profit):
+        ist_offset = timedelta(hours=5, minutes=30)
+        today_ist = (datetime.now(timezone.utc) + ist_offset).date()
+        if self._daily_loss_date != today_ist:
+            self._daily_loss_date = today_ist
+            self._daily_realized_loss = 0.0
+            self._kill_switch_active = False
+        if net_profit < 0:
+            self._daily_realized_loss += abs(net_profit)
+        if self.daily_loss_limit_pct > 0 and self.max_budget > 0:
+            loss_cap = self.max_budget * (self.daily_loss_limit_pct / 100.0)
+            if self._daily_realized_loss >= loss_cap and not self._kill_switch_active:
+                self._kill_switch_active = True
+                self.log_trade("KILL SWITCH", "SYSTEM", "0", f"₹{self._daily_realized_loss:.2f}",
+                                f"Daily realized loss hit {self.daily_loss_limit_pct:.1f}% of budget. New entries paused until tomorrow (IST).", "Halted")
+
     def _scan_for_entries(self):
-        current_invested = sum(p['invested'] for p in self.active_positions.values())
+        if self._kill_switch_active:
+            self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "Daily loss kill-switch is active. No new entries until tomorrow (IST).", "Halted")
+            return
+
+        current_invested = sum(p['invested'] for p in list(self.active_positions.values()))
         available_budget = self.max_budget - current_invested
+        
+        max_trade_allocation = self.max_budget * (self.max_position_pct / 100.0)
         
         if available_budget >= 110.0:
             best_candidate_coin = None
             best_candidate_market = None
             best_candidate_price = 0
             best_atr = 0.0
-            best_summary = ""
             best_setup_score = -999.0
             
             rejected_by_macro = []
@@ -590,14 +703,14 @@ class GlobalBotEngine:
                     rejected_by_macro.append(coin)
                     continue
                 
-                candles_15m = self.fetch_candle_data(coin, interval="15m", limit=50)
+                candles_15m = self.fetch_candle_data(coin, interval="15m", limit=200)
                 time.sleep(0.4)
                 
                 if candles_15m:
                     try:
                         df_15m = self.process_df_indicators(candles_15m)
+                        if len(df_15m) == 0: continue
                         
-                        latest_rsi = df_15m['RSI'].iloc[-1]
                         latest_adx = df_15m['ADX'].iloc[-1]
                         latest_vol = df_15m['volume'].iloc[-1]
                         latest_vol_sma = df_15m['Vol_SMA_20'].iloc[-1]
@@ -612,7 +725,6 @@ class GlobalBotEngine:
                             rejected_by_vol.append(coin)
                             continue
 
-                        # Score based on momentum strength + volume surge
                         vol_multiplier = latest_vol / latest_vol_sma
                         setup_score = latest_adx + (vol_multiplier * 10)
 
@@ -623,96 +735,71 @@ class GlobalBotEngine:
                             best_candidate_price = curr_price
                             best_atr = latest_atr
                             
-                            # Create a clean, human-readable summary for the LLM
-                            best_summary = f"""
-                            Asset: {coin}
-                            Current Price: {curr_price}
-                            Macro Trend: Bullish (Price is above 1-Hour 200 EMA)
-                            15m ADX (Trend Strength): {latest_adx:.1f} (Above 25 = Strong Trend)
-                            15m RSI: {latest_rsi:.1f}
-                            Volume Surge: {vol_multiplier:.1f}x higher than the 20-candle average.
-                            """
                     except Exception as e:
                         continue
 
-            if best_candidate_coin and best_summary:
-                # SINGLE LLM SANITY CHECK (Llama 3.3)
-                client = Groq(api_key=GROQ_API_KEY)
-                system_prompt = """You are an elite hedge fund risk manager. The Python quant engine has already verified that this coin is in a massive, volume-backed mathematical breakout.
-                Your job is to read the summary of the technical indicators. 
-                If the data shows strong momentum (ADX > 25) and high volume, output 'BUY' to authorize the trade.
-                Respond ONLY in JSON format: {"action": "BUY" or "HOLD", "reasoning": "1 short sentence"}"""
-                
+            if best_candidate_coin:
+                reasoning = f"ADX {best_setup_score:.1f}-scored breakout passed macro trend, ADX>25, and 1.5x volume filters."
                 try:
-                    response = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": f"Review this mathematical breakout:\n{best_summary}"}
-                        ],
-                        response_format={"type": "json_object"}, temperature=0.1
-                    )
-                    decision_data = json.loads(response.choices[0].message.content)
-                    action = decision_data.get("action", "HOLD").upper()
-                    reasoning = decision_data.get("reasoning", "Llama 3.3 Sanity Check passed.")
+                    precision = self.market_precision.get(best_candidate_market, 5)
+                    multiplier = 10 ** precision
 
-                    if action == "BUY":
-                        precision = self.market_precision.get(best_candidate_market, 5)
-                        multiplier = 10 ** precision
+                    usable_cash = min(available_budget, self.inr_balance, max_trade_allocation)
+                    target_cost_excluding_fees = usable_cash / self.buy_fee_multiplier
+                    
+                    raw_crypto = target_cost_excluding_fees / best_candidate_price
+                    buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
+                    
+                    min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
+                    if buy_crypto_amount < min_required_qty: 
+                        buy_crypto_amount = min_required_qty
                         
-                        usable_cash = min(available_budget, self.inr_balance)
-                        target_cost_excluding_fees = usable_cash / self.buy_fee_multiplier
-                        
-                        raw_crypto = target_cost_excluding_fees / best_candidate_price
-                        buy_crypto_amount = math.floor(raw_crypto * multiplier) / multiplier
-                        
-                        min_required_qty = self.market_min_qty.get(best_candidate_market, 0.0001)
-                        if buy_crypto_amount < min_required_qty: 
-                            buy_crypto_amount = min_required_qty
-                            
+                    actual_cost = buy_crypto_amount * best_candidate_price
+                    if actual_cost < 105.0:
+                        required_for_105 = 105.0 / best_candidate_price
+                        buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
                         actual_cost = buy_crypto_amount * best_candidate_price
-                        if actual_cost < 105.0:
-                            required_for_105 = 105.0 / best_candidate_price
-                            buy_crypto_amount = math.ceil(required_for_105 * multiplier) / multiplier
-                            actual_cost = buy_crypto_amount * best_candidate_price
-                            
-                        total_invested_with_fees = actual_cost * self.buy_fee_multiplier
+                        
+                    total_invested_with_fees = actual_cost * self.buy_fee_multiplier
 
-                        if total_invested_with_fees > self.inr_balance:
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient real INR Balance in wallet.", "Failed")
-                        elif total_invested_with_fees > (available_budget + 15.0): 
-                            self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Exchange min qty exceeds your remaining budget.", "Limit Enforced")
-                        else:
-                            formatted_qty = f"{buy_crypto_amount:.{precision}f}"
-                            order_body = {
-                                "side": "buy", "order_type": "limit_order", "market": best_candidate_market,
-                                "price_per_unit": float(best_candidate_price), "total_quantity": float(formatted_qty), 
-                                "timestamp": int(round(time.time() * 1000))
-                            }
-                            res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
-                            if "orders" in res or "id" in res:
-                                breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
-                                initial_sl = best_candidate_price - (2.0 * best_atr) # Give it room to breathe
-                                
-                                self.active_positions[best_candidate_coin] = {
-                                    "qty": buy_crypto_amount, 
-                                    "entry_price": best_candidate_price,
-                                    "invested": total_invested_with_fees, 
-                                    "sl_price": initial_sl,
-                                    "peak_price": best_candidate_price,
-                                    "atr": best_atr,
-                                    "breakeven_price": breakeven_price,
-                                    "risk_free_active": False,
-                                    "buy_time": time.time()
-                                }
-                                self.log_trade("ALL-IN BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
-                            else:
-                                err = res.get("error", "API Error")
-                                self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
+                    if total_invested_with_fees > self.inr_balance:
+                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient real INR Balance in wallet.", "Failed")
+                    elif total_invested_with_fees > (available_budget + 15.0): 
+                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Min qty exceeds remaining budget.", "Limit Enforced")
                     else:
-                        self.log_trade("AI HOLD (ENTRY)", best_candidate_coin, "0", f"₹{best_candidate_price:.2f}", reasoning, "AI Denied")
+                        formatted_qty = f"{buy_crypto_amount:.{precision}f}"
+                        
+                        # ✨ VITAL FIX: Pure Market Order Format (No price_per_unit allowed)
+                        order_body = {
+                            "side": "buy", 
+                            "order_type": "market_order", 
+                            "market": best_candidate_market,
+                            "total_quantity": float(formatted_qty),
+                            "timestamp": int(round(time.time() * 1000))
+                        }
+                        res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
+                        if order_succeeded(res):
+                            breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
+                            initial_sl = best_candidate_price - (2.0 * best_atr)
+                            
+                            self.active_positions[best_candidate_coin] = {
+                                "qty": buy_crypto_amount, 
+                                "entry_price": best_candidate_price,
+                                "invested": total_invested_with_fees, 
+                                "sl_price": initial_sl,
+                                "peak_price": best_candidate_price,
+                                "atr": best_atr,
+                                "breakeven_price": breakeven_price,
+                                "risk_free_active": False,
+                                "sync_misses": 0,
+                                "buy_time": time.time()
+                            }
+                            self.log_trade("QUANT STRIKE", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", "0ms Mathematical Breakout Confirmation.", "Success")
+                        else:
+                            err = res.get("error", "API Error")
+                            self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                 except Exception as e:
-                    pass
+                    self.log_trade("BUY FAILED", best_candidate_coin, "0", "₹0.00", f"Entry execution error: {str(e)}", "Error")
             else:
                 if rejected_by_macro:
                     coins = f"{len(rejected_by_macro)} assets" if len(rejected_by_macro) > 4 else ", ".join(rejected_by_macro)
@@ -726,12 +813,12 @@ class GlobalBotEngine:
                 else:
                     self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No explosive setups found.", "Standby")
 
-# Cache Buster v67
+# Cache Buster vFinal
 @st.cache_resource
-def get_bot_engine_v67():
+def get_bot_engine_vFinal():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v67()
+bot = get_bot_engine_vFinal()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -771,7 +858,9 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("#### System Health")
 
 if bot.is_running:
-    if getattr(bot, "api_is_down", False):
+    if getattr(bot, "_kill_switch_active", False):
+        st.sidebar.markdown("""<div style="background: #fef7e0; border: 1px solid #fde293; border-radius: 8px; padding: 12px; color: #b06000; font-weight: 600; font-size: 0.9rem; text-align: center;">🟡 DAILY LOSS LIMIT HIT — ENTRIES PAUSED</div>""", unsafe_allow_html=True)
+    elif getattr(bot, "api_is_down", False):
         st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 COINDCX API DOWN/LAGGING</div>""", unsafe_allow_html=True)
     else:
         st.sidebar.markdown("""<div style="background: #e6f4ea; border: 1px solid #ceead6; border-radius: 8px; padding: 12px; color: #137333; font-weight: 600; font-size: 0.9rem; text-align: center;">🟢 APEX ENGINE ACTIVE</div>""", unsafe_allow_html=True)
@@ -779,7 +868,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 ENGINE STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 67.0 (Python-Dominant Swing Trader)")
+st.sidebar.caption("Version 69.0 (Quant Architecture)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -824,14 +913,30 @@ if page == "⚙️ Bot Engine & Settings":
         exchange_fee_pct = st.number_input("Exchange Fee % (e.g. 0.5)", min_value=0.0, value=float(bot.exchange_fee_pct), step=0.1)
     with colC:
         tds_pct = st.number_input("Govt TDS % (e.g. 1.0)", min_value=0.0, value=float(bot.tds_pct), step=0.1)
-        
-    st.info(f"🛡️ **Tax Shield Active:** The bot will dynamically size up to **₹{max_bud:.2f}** into the best confirmed breakout. Exits are handled 100% mechanically by Python to prevent LLM latency delays.", icon="🎯")
+
+    st.markdown("<br>#### 🛡️ Risk Controls", unsafe_allow_html=True)
+    colD, colE = st.columns(2)
+    with colD:
+        max_position_pct = st.slider(
+            "Max Capital Per Single Trade (%)", min_value=10, max_value=100,
+            value=int(bot.max_position_pct), step=5,
+            help="Caps how much of your Max Capital Strike can go into one coin at once. 100% = old all-in behavior. Lower this to diversify across multiple concurrent setups."
+        )
+    with colE:
+        daily_loss_limit_pct = st.slider(
+            "Daily Loss Kill-Switch (% of budget)", min_value=0, max_value=50,
+            value=int(bot.daily_loss_limit_pct), step=5,
+            help="If today's realized losses reach this % of your Max Capital Strike, the bot stops opening new positions until the next day (IST). 0 = disabled."
+        )
+
+    st.info(f"🛡️ **Tax Shield Active:** The bot will size up to **₹{max_bud * max_position_pct / 100.0:.2f}** ({max_position_pct}% of budget) per trade. Exits are handled 100% mechanically by Python to prevent latency delays.", icon="🎯")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
     with ctrl_col1:
         if st.button("▶️ Start Apex Engine", type="primary", use_container_width=True, disabled=bot.is_running):
-            bot.start(candidate_input, top_n, max_bud, exchange_fee_pct, tds_pct, candle_interval)
+            bot.start(candidate_input, top_n, max_bud, exchange_fee_pct, tds_pct, candle_interval,
+                      max_position_pct, daily_loss_limit_pct)
             st.rerun()
     with ctrl_col2:
         if st.button("⏹️ Stop Engine", use_container_width=True, disabled=not bot.is_running):
@@ -908,7 +1013,7 @@ if page == "⚙️ Bot Engine & Settings":
         else:
             ist_offset = timedelta(hours=5, minutes=30)
             formatted_logs = []
-            for entry in bot.trade_log:
+            for entry in list(bot.trade_log):
                 e = entry.copy()
                 if "timestamp" in e:
                     utc_dt = datetime.fromtimestamp(e["timestamp"], tz=timezone.utc)
@@ -998,10 +1103,10 @@ elif page == "📊 Live Dashboard":
                     else: period_stats["last_month"]["loss"] += abs(net_pnl)
                     period_stats["last_month"]["count"] += 1
 
-        current_invested = sum(p['invested'] for p in bot.active_positions.values())
+        current_invested = sum(pos['invested'] for coin, pos in list(bot.active_positions.items()))
         unrealized_net_pnl = 0.0
         
-        for coin, pos in bot.active_positions.items():
+        for coin, pos in list(bot.active_positions.items()):
             live_p = live_prices.get(f"{coin}INR", pos['entry_price'])
             net_live_value = (pos['qty'] * live_p) * bot.sell_fee_multiplier
             unrealized_net_pnl += (net_live_value - pos['invested'])
@@ -1065,7 +1170,7 @@ elif page == "📊 Live Dashboard":
             st.info("No active positions held. Waiting for a mathematically confirmed volume breakout.")
         else:
             pos_data = []
-            for coin, pos in bot.active_positions.items():
+            for coin, pos in list(bot.active_positions.items()):
                 curr_price = live_prices.get(f"{coin}INR", pos['entry_price'])
                 
                 net_live_value = (pos['qty'] * curr_price) * bot.sell_fee_multiplier
