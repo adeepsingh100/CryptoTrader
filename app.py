@@ -96,9 +96,6 @@ def coindcx_get_with_retry(url, max_retries=3, timeout=20):
             return None
 
 def order_succeeded(res):
-    # Old check was `"orders" in res or "id" in res`, which treats a response like
-    # {"orders": []} (order rejected, empty list) as a success. Require a non-empty
-    # orders list or a top-level id before we trust that an order was actually placed.
     if not isinstance(res, dict) or "error" in res:
         return False
     if res.get("id"):
@@ -107,9 +104,6 @@ def order_succeeded(res):
     return bool(orders)
 
 def safe_float(val, default=0.0):
-    # Exchange APIs occasionally return null/missing/malformed numeric fields.
-    # float(None) or float("") raises and, unguarded, can crash a whole parsing
-    # pass over a balances/ticker/markets response over a single bad row.
     try:
         if val is None:
             return default
@@ -140,11 +134,6 @@ class GoogleSheetsManager:
         self.errors_sheet = None
         self.last_error = None
 
-        # Every append_* call used to hit the Google Sheets API synchronously on
-        # whichever thread called it — including the trading thread itself. If Sheets
-        # was slow or down, that blocked exit-monitoring (the "instant, mechanical
-        # exits" the bot advertises) for however long the network call took. Writes
-        # are now queued and drained by a single dedicated worker thread instead.
         self._write_queue = queue.Queue()
         self._last_connect_attempt = 0.0
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -153,8 +142,6 @@ class GoogleSheetsManager:
     def _ensure_connected_throttled(self):
         if self.trades_sheet:
             return True
-        # If Sheets is down/misconfigured, don't hammer Google's auth API on every
-        # queued write — back off to one connection attempt per minute.
         now = time.time()
         if now - self._last_connect_attempt < 60:
             return False
@@ -166,7 +153,7 @@ class GoogleSheetsManager:
             kind, payload = self._write_queue.get()
             try:
                 if not self._ensure_connected_throttled():
-                    continue  # Sheets unreachable; drop this write, trading isn't affected.
+                    continue 
                 if kind == "trade":
                     self._do_append_trade(payload)
                 elif kind == "log":
@@ -215,9 +202,6 @@ class GoogleSheetsManager:
             return False
 
     def load_trades(self):
-        # Called once at startup on the main Streamlit thread, before the trading
-        # thread exists, so a synchronous connect() here is fine (nothing else is
-        # waiting on this thread).
         if not self.trades_sheet and not self.connect():
             return []
         try:
@@ -255,7 +239,6 @@ class GoogleSheetsManager:
             return []
 
     def append_trade(self, trade_record):
-        # Non-blocking: hand off to the worker thread instead of writing here.
         self._write_queue.put(("trade", trade_record))
 
     def append_log(self, log_entry):
@@ -307,7 +290,7 @@ def get_gs_manager():
 gs_manager = get_gs_manager()
 
 # ==========================================
-# 3. PURE PYTHON SWING ENGINE (vFinal)
+# 3. PURE PYTHON QUANT ENGINE (vFinal)
 # ==========================================
 class GlobalBotEngine:
     _active_instances = []
@@ -327,19 +310,18 @@ class GlobalBotEngine:
         self.auto_top_n = 0 
         
         self.max_budget = 1000.0
-        self.candle_interval = "15m"  
+        self.candle_interval = "1h"  
         
         self.exchange_fee_pct = 0.5 
         self.tds_pct = 1.0 
 
-        # --- Risk management additions ---
-        self.max_position_pct = 100.0   # % of max_budget allowed in a single trade (100 = old all-in behavior)
-        self.daily_loss_limit_pct = 0.0  # % of max_budget; 0 disables the kill-switch
+        self.max_position_pct = 100.0   
+        self.daily_loss_limit_pct = 0.0  
         self._daily_loss_date = None
         self._daily_realized_loss = 0.0
         self._kill_switch_active = False
-        self._atr_refresh_counter = {}   # per-coin loop counter to periodically refresh ATR
-        self._top_n_last_refresh = 0     # last time the auto top-N-by-volume list was refreshed
+        self._atr_refresh_counter = {}   
+        self._top_n_last_refresh = 0     
         
         self.inr_balance = 0.0
         self.active_positions = {}
@@ -362,11 +344,26 @@ class GlobalBotEngine:
 
     @property
     def fee_config_is_sane(self):
-        # If someone sets Exchange Fee % / TDS % unrealistically high, sell_fee_multiplier
-        # can hit zero or go negative — every P&L, breakeven, and stop-loss calculation
-        # downstream silently corrupts (selling would "cost" more than the trade is worth,
-        # divisions can blow up). Refuse to trade rather than run on broken math.
         return self.sell_fee_multiplier > 0.5
+
+    def _check_circuit_breaker(self):
+        now = time.time()
+        twenty_four_hours_ago = now - 86400
+        daily_loss = 0.0
+        # Iterate over a copy to ensure thread safety
+        for trade in list(self.completed_trades):
+            if trade.get("timestamp", 0) >= twenty_four_hours_ago:
+                pnl = float(trade.get("pnl", 0.0))
+                if pnl < 0:
+                    daily_loss += abs(pnl)
+        
+        max_allowed_loss = self.max_budget * (self.daily_loss_limit_pct / 100.0)
+        
+        if daily_loss >= max_allowed_loss and self.daily_loss_limit_pct > 0:
+            self.log_trade("SYSTEM STOP", "ALL", "0", "₹0.00", f"CIRCUIT BREAKER: 24h loss (₹{daily_loss:.2f}) exceeded {self.daily_loss_limit_pct}% limit.", "Emergency")
+            self.stop()
+            return True
+        return False
 
     def log_trade(self, action, coin, qty, value, reason, status):
         log_entry = {
@@ -406,9 +403,9 @@ class GlobalBotEngine:
 
     def get_interval_seconds(self):
         interval_map = {"1m": 60, "15m": 900, "1h": 3600, "1d": 86400}
-        return interval_map.get(self.candle_interval, 900)
+        return interval_map.get(self.candle_interval, 3600)
 
-    def fetch_candle_data(self, coin, interval=None, limit=50):
+    def fetch_candle_data(self, coin, interval=None, limit=200):
         market_name = f"{coin}INR"
         pair = self.market_pair_string.get(market_name, f"I-{coin}_INR")
         actual_interval = interval or self.candle_interval
@@ -426,6 +423,12 @@ class GlobalBotEngine:
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
         df = df.sort_values(by='time', ascending=True)
+
+        # ✨ DROP ACTIVE UNCLOSED CANDLE TO PREVENT DATA CORRUPTION
+        df = df.iloc[:-1].copy()
+        
+        if len(df) < 15:
+            return df
 
         df['Vol_SMA_20'] = df['volume'].rolling(window=20).mean()
 
@@ -462,6 +465,8 @@ class GlobalBotEngine:
         return df
 
     def check_htf_trend(self, coin):
+        # We always fetch a 1-Hour chart to ensure the macro trend is bullish, 
+        # regardless of what the user's execution timeframe is.
         candles = self.fetch_candle_data(coin, interval="1h", limit=250)
         time.sleep(0.4) 
         if candles and len(candles) >= 200:
@@ -475,15 +480,15 @@ class GlobalBotEngine:
                 return latest_close > latest_ema 
             except Exception:
                 pass
-        # Previously defaulted to True ("assume bullish") when 1H data was missing or
-        # malformed, meaning an API hiccup could let a trade through with an unconfirmed
-        # macro trend. Fail closed instead: no data = no trade this cycle.
         return False
 
     def _run_loop(self):
         last_candle_block = 0
         while self.is_running:
             try:
+                if self._check_circuit_breaker():
+                    break
+                    
                 success = self._fetch_market_state()
                 self.api_is_down = not success
                 
@@ -511,6 +516,14 @@ class GlobalBotEngine:
                 time.sleep(1)
 
     def _fetch_market_state(self):
+        # ✨ FIX 1: Reset Daily Kill-Switch globally on calendar day change
+        ist_offset = timedelta(hours=5, minutes=30)
+        today_ist = (datetime.now(timezone.utc) + ist_offset).date()
+        if self._daily_loss_date != today_ist:
+            self._daily_loss_date = today_ist
+            self._daily_realized_loss = 0.0
+            self._kill_switch_active = False
+
         balance_body = {"timestamp": int(round(time.time() * 1000))}
         balances_data = coindcx_auth_post("/exchange/v1/users/balances", balance_body, max_retries=3, timeout=20)
         
@@ -545,9 +558,6 @@ class GlobalBotEngine:
         if isinstance(tickers, list):
             self.last_prices = {t['market']: safe_float(t['last_price']) for t in tickers if isinstance(t, dict) and 'market' in t and t.get('last_price') is not None}
             
-            # Previously only ran once when self.candidates was still empty, so the
-            # "top N by volume" list was frozen at whatever it was when the bot started
-            # and never adapted as volume leaders changed. Refresh every 6 hours.
             top_n_stale = (time.time() - getattr(self, "_top_n_last_refresh", 0)) > 21600
             if self.auto_top_n > 0 and (len(self.candidates) == 0 or top_n_stale):
                 inr_markets = []
@@ -581,50 +591,43 @@ class GlobalBotEngine:
                             "qty": actual_balances[coin],
                             "entry_price": curr_price,
                             "invested": invested_with_fees,
-                            "sl_price": curr_price * 0.90, # 10% default loose SL until calculated
+                            "sl_price": curr_price * 0.90, 
                             "peak_price": curr_price,
                             "atr": curr_price * 0.02,
                             "breakeven_price": breakeven,
                             "risk_free_active": False,
+                            "sync_misses": 0,
                             "buy_time": time.time() - 200
                         }
                         self.log_trade("SYNC BUY", coin, f"{actual_balances[coin]:.4f}", f"₹{invested_with_fees:.2f}", "Detected external wallet asset.", "Wallet Sync")
 
+        # ✨ FIX 2: 3-Strike Memory Protection against transient API JSON Drops
         for coin in list(self.active_positions.keys()):
             pos = self.active_positions[coin]
             if time.time() - pos.get('buy_time', 0) < 180:
                 continue
 
-            if coin not in actual_balances:
-                # Wallet genuinely no longer holds this coin (e.g. sold manually
-                # outside the bot). Safe to drop tracking.
-                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
-                del self.active_positions[coin]
-                continue
-
             live_price = self.last_prices.get(f"{coin}INR")
             if live_price is None:
-                # No fresh ticker price for this market this cycle. The OLD code used
-                # .get(..., 0), which turns a transient missing-ticker glitch into
-                # "value = balance * 0 = 0 < 50" -> silently deletes a real open
-                # position from tracking (no sell order ever placed, no stop-loss
-                # ever applied again). Skip the check this cycle instead of guessing.
                 continue
 
-            if actual_balances[coin] * live_price < 50:
-                self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset no longer in wallet.", "Wallet Sync")
-                del self.active_positions[coin]
+            if coin not in actual_balances or (actual_balances[coin] * live_price < 50):
+                misses = pos.get('sync_misses', 0) + 1
+                pos['sync_misses'] = misses
+                
+                if misses >= 3:
+                    self.log_trade("SYNC SELL", coin, "0", "₹0.00", "Asset missing from wallet (Verified 3x).", "Wallet Sync")
+                    del self.active_positions[coin]
+            else:
+                pos['sync_misses'] = 0
                 
         return True 
 
     def _monitor_live_exits(self):
-        # 100% PURE PYTHON EXITS. No LLM delays. Instant execution.
         for coin in list(self.active_positions.keys()):
             try:
                 self._check_single_exit(coin)
             except Exception as e:
-                # A problem with one coin (bad data, a KeyError, etc.) must not stop the
-                # rest of the open positions from being checked this cycle.
                 self.log_trade("MONITOR ERROR", coin, "0", "₹0.00", f"Exit check failed: {str(e)}", "Error")
 
     def _check_single_exit(self, coin):
@@ -635,29 +638,24 @@ class GlobalBotEngine:
         pos = self.active_positions.get(coin)
         if not pos: return
 
-        # ATR was previously frozen at entry-time forever, so the trailing-stop
-        # distance never adapted to changing volatility over a long hold.
-        # Refresh it roughly every ~20 loop iterations (a few minutes) per coin.
         self._atr_refresh_counter[coin] = self._atr_refresh_counter.get(coin, 0) + 1
         if self._atr_refresh_counter[coin] >= 20:
             self._atr_refresh_counter[coin] = 0
             try:
-                fresh_candles = self.fetch_candle_data(coin, interval="15m", limit=30)
+                fresh_candles = self.fetch_candle_data(coin, interval=self.candle_interval, limit=200)
                 if fresh_candles:
                     fresh_df = self.process_df_indicators(fresh_candles)
-                    fresh_atr = fresh_df['ATR'].iloc[-1]
-                    if not pd.isna(fresh_atr) and fresh_atr > 0:
-                        pos['atr'] = fresh_atr
+                    if len(fresh_df) > 0:
+                        fresh_atr = fresh_df['ATR'].iloc[-1]
+                        if not pd.isna(fresh_atr) and fresh_atr > 0:
+                            pos['atr'] = fresh_atr
             except Exception:
                 pass
 
         if curr_price > pos['peak_price']:
             pos['peak_price'] = curr_price
 
-        # Trailing Stop: 2x ATR behind the peak price
         dynamic_sl = pos['peak_price'] - (2.0 * pos['atr'])
-
-        # The Tax Shield Pivot (Activates at +3% profit margin)
         pivot_threshold = pos['breakeven_price'] * 1.03
 
         if not pos['risk_free_active'] and curr_price > pivot_threshold:
@@ -665,7 +663,6 @@ class GlobalBotEngine:
             self.log_trade("RISK-FREE PIVOT", coin, "0", f"₹{curr_price:.2f}", "Price cleared 3% profit margin. Stop-Loss mechanically locked above breakeven.", "Shield Up")
 
         if pos['risk_free_active']:
-            # Floor the SL at Breakeven + 0.2% so a loss is mathematically impossible
             guaranteed_sl = pos['breakeven_price'] * 1.002
             pos['sl_price'] = max(pos['sl_price'], dynamic_sl, guaranteed_sl)
         else:
@@ -686,32 +683,23 @@ class GlobalBotEngine:
         
         gross_value = sell_qty * curr_price
 
-        # Exchange enforces a practical minimum order value (~₹100). If the position's
-        # remaining value has fallen below that (e.g. a fast crash), the OLD code silently
-        # skipped the sell forever, leaving the position open with unlimited downside.
-        # Instead: try the real sell first; only if the exchange itself rejects it as
-        # too small do we mark the position as an unrecoverable "dust" write-off so the
-        # bot stops pretending it still holds a manageable position.
         if sell_qty <= 0:
             self.log_trade("SELL SKIPPED", coin, "0", "₹0.00", "Sell quantity rounds to zero.", "Error")
             return
 
         formatted_qty = f"{sell_qty:.{precision}f}"
-        # Market order (not limit): during a fast drop, a limit sell at the last-seen
-        # price can simply sit unfilled while price keeps falling past it, leaving the
-        # "closed" position actually still open with no real stop-loss protection.
+        
+        # ✨ FIX: Strict Market Order JSON Format (No Price_per_unit)
         order_body = {
-            "side": "sell", "order_type": "market_order", "market": market,
+            "side": "sell", 
+            "order_type": "market_order", 
+            "market": market,
             "total_quantity": float(formatted_qty),
             "timestamp": int(round(time.time() * 1000))
         }
         res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
+        
         if order_succeeded(res):
-            # The exchange order is already filled at this point — real money has moved.
-            # Everything below is bookkeeping. If any of it throws (bad data, sheet
-            # error, etc.) we must still drop the position from active_positions in
-            # the `finally` below; otherwise the bot would keep believing it owns a
-            # position that's actually already closed, and keep trying to re-sell it.
             try:
                 net_received = gross_value * self.sell_fee_multiplier
                 net_profit = net_received - pos['invested']
@@ -728,18 +716,15 @@ class GlobalBotEngine:
                 gs_manager.append_trade(trade_record)
 
                 self.log_trade("SELL", coin, formatted_qty, f"₹{net_received:.2f}", reasoning, "Success")
-            except Exception as e:
-                self.log_trade("SELL (unrecorded)", coin, formatted_qty, f"₹{gross_value:.2f}",
-                                f"Order filled on the exchange but local bookkeeping failed: {e}. Verify P&L manually.", "Warning")
+            except Exception as bookkeeping_error:
+                self.log_trade("SELL UNRECORDED", coin, formatted_qty, f"₹{gross_value:.2f}",
+                                f"Order filled on exchange but bot bookkeeping failed: {bookkeeping_error}. Check manually.", "Warning")
             finally:
                 if coin in self.active_positions:
                     del self.active_positions[coin]
         else:
             err = res.get("error", "API Error")
             if gross_value < 100.0:
-                # Genuinely below the exchange's tradable minimum. Rather than let it sit
-                # forever with an active stop-loss that can never fire, write it off as
-                # realized dust so it stops occupying budget and the loss is accounted for.
                 try:
                     net_profit = -pos['invested']
                     self.realized_pnl += net_profit
@@ -776,62 +761,56 @@ class GlobalBotEngine:
 
     def _scan_for_entries(self):
         if self._kill_switch_active:
-            self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "Daily loss kill-switch is active. No new entries until tomorrow (IST).", "Halted")
+            self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "Daily loss kill-switch is active. No new entries until tomorrow.", "Halted")
             return
 
         if not self.fee_config_is_sane:
-            self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "Exchange Fee % / TDS % settings are too high — P&L math would be unreliable. Fix settings and restart.", "Config Error")
+            self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "Fee settings too high.", "Config Error")
             return
 
         current_invested = sum(p['invested'] for p in list(self.active_positions.values()))
         available_budget = self.max_budget - current_invested
+        max_trade_allocation = self.max_budget * (self.max_position_pct / 100.0)
         
         if available_budget >= 110.0:
             best_candidate_coin = None
             best_candidate_market = None
             best_candidate_price = 0
             best_atr = 0.0
-            best_summary = ""
             best_setup_score = -999.0
             
-            rejected_by_macro = []
-            rejected_by_adx = []
-            rejected_by_vol = []
+            # ✨ FIX 4: Pre-cache HTF to avoid loop execution lag
+            htf_cache = {}
+            for coin in self.candidates:
+                if coin not in self.active_positions:
+                    htf_cache[coin] = self.check_htf_trend(coin)
 
             for coin in self.candidates:
                 if coin in self.active_positions: continue
+                if not htf_cache.get(coin, False): continue
                 
                 market = f"{coin}INR"
                 curr_price = self.last_prices.get(market)
                 if not curr_price: continue
                 
-                if not self.check_htf_trend(coin): 
-                    rejected_by_macro.append(coin)
-                    continue
-                
-                candles_entry_tf = self.fetch_candle_data(coin, interval=self.candle_interval, limit=50)
-                time.sleep(0.4)
+                candles_entry_tf = self.fetch_candle_data(coin, interval=self.candle_interval, limit=200)
                 
                 if candles_entry_tf:
                     try:
                         df_entry_tf = self.process_df_indicators(candles_entry_tf)
+                        if len(df_entry_tf) < 15: continue
                         
-                        latest_rsi = df_entry_tf['RSI'].iloc[-1]
                         latest_adx = df_entry_tf['ADX'].iloc[-1]
                         latest_vol = df_entry_tf['volume'].iloc[-1]
                         latest_vol_sma = df_entry_tf['Vol_SMA_20'].iloc[-1]
                         latest_atr = df_entry_tf['ATR'].iloc[-1]
                         
-                        # PURE MATHEMATICAL ENTRY GATES
                         if pd.isna(latest_adx) or latest_adx < 25.0:
-                            rejected_by_adx.append(coin)
                             continue
                             
                         if latest_vol < (1.5 * latest_vol_sma):
-                            rejected_by_vol.append(coin)
                             continue
 
-                        # Score based on momentum strength + volume surge
                         vol_multiplier = latest_vol / latest_vol_sma
                         setup_score = latest_adx + (vol_multiplier * 10)
 
@@ -841,33 +820,18 @@ class GlobalBotEngine:
                             best_candidate_market = market
                             best_candidate_price = curr_price
                             best_atr = latest_atr
-                            
-                            # Create a clean, human-readable summary for the LLM
-                            best_summary = f"""
-                            Asset: {coin}
-                            Current Price: {curr_price}
-                            Macro Trend: Bullish (Price is above 1-Hour 200 EMA)
-                            15m ADX (Trend Strength): {latest_adx:.1f} (Above 25 = Strong Trend)
-                            15m RSI: {latest_rsi:.1f}
-                            Volume Surge: {vol_multiplier:.1f}x higher than the 20-candle average.
-                            """
-                    except Exception as e:
+                    except Exception:
                         continue
 
-            if best_candidate_coin and best_summary:
-                # Llama/Groq sanity check removed — it was rubber-stamping every setup
-                # that already passed the math filters (ADX > 25, 1.5x volume, bullish
-                # macro trend), while adding latency and an extra external dependency.
-                # The mathematical gates above are the actual decision now.
-                reasoning = f"ADX {best_setup_score:.1f}-scored breakout passed macro trend, ADX>25, and 1.5x volume filters."
+            if best_candidate_coin:
+                reasoning = f"ADX {best_setup_score:.1f}-scored breakout passed filters."
                 try:
                     precision = self.market_precision.get(best_candidate_market, 5)
                     multiplier = 10 ** precision
 
-                    # Cap this single trade's size at max_position_pct of max_budget instead of
-                    # dumping the entire remaining budget into one coin (old "ALL-IN" behavior).
-                    per_trade_cap = self.max_budget * (self.max_position_pct / 100.0)
-                    usable_cash = min(available_budget, self.inr_balance, per_trade_cap)
+                    # ✨ FIX 3: Slippage Buffer
+                    slippage_buffer = 0.98
+                    usable_cash = min(available_budget, self.inr_balance, max_trade_allocation) * slippage_buffer
                     target_cost_excluding_fees = usable_cash / self.buy_fee_multiplier
                     
                     raw_crypto = target_cost_excluding_fees / best_candidate_price
@@ -886,28 +850,25 @@ class GlobalBotEngine:
                     total_invested_with_fees = actual_cost * self.buy_fee_multiplier
 
                     if total_invested_with_fees > self.inr_balance:
-                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient real INR Balance in wallet.", "Failed")
+                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Insufficient INR Balance.", "Failed")
                     elif total_invested_with_fees > (available_budget + 15.0): 
-                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", f"Exchange min qty exceeds your remaining budget.", "Limit Enforced")
+                        self.log_trade("BUY SKIPPED", best_candidate_coin, "0", f"₹{total_invested_with_fees:.2f}", "Exceeds budget.", "Enforced")
                     else:
                         formatted_qty = f"{buy_crypto_amount:.{precision}f}"
-                        # Market order: a limit buy at the breakout price can fail to fill if
-                        # price keeps running, leaving the bot's internal state (an "active
-                        # position" with qty/entry) out of sync with what was actually bought.
+                        
+                        # ✨ FIX: Strict Market Order JSON Format
                         order_body = {
-                            "side": "buy", "order_type": "market_order", "market": best_candidate_market,
+                            "side": "buy", 
+                            "order_type": "market_order", 
+                            "market": best_candidate_market,
                             "total_quantity": float(formatted_qty),
                             "timestamp": int(round(time.time() * 1000))
                         }
                         res = coindcx_auth_post("/exchange/v1/orders/create", order_body, max_retries=3, timeout=20)
                         if order_succeeded(res):
-                            # Real money has now been spent on the exchange. Anything that
-                            # goes wrong from here must NOT be reported as "BUY FAILED" (which
-                            # would imply nothing happened) — it must loudly flag that a
-                            # position exists on the exchange that the bot isn't tracking.
                             try:
                                 breakeven_price = best_candidate_price * (self.buy_fee_multiplier / self.sell_fee_multiplier)
-                                initial_sl = best_candidate_price - (2.0 * best_atr) # Give it room to breathe
+                                initial_sl = best_candidate_price - (2.0 * best_atr)
 
                                 self.active_positions[best_candidate_coin] = {
                                     "qty": buy_crypto_amount, 
@@ -918,38 +879,27 @@ class GlobalBotEngine:
                                     "atr": best_atr,
                                     "breakeven_price": breakeven_price,
                                     "risk_free_active": False,
+                                    "sync_misses": 0,
                                     "buy_time": time.time()
                                 }
                                 self.log_trade("BUY", best_candidate_coin, formatted_qty, f"₹{total_invested_with_fees:.2f}", reasoning, "Success")
                             except Exception as bookkeeping_error:
-                                self.log_trade("BUY UNTRACKED — CHECK MANUALLY", best_candidate_coin, formatted_qty,
+                                self.log_trade("BUY UNTRACKED", best_candidate_coin, formatted_qty,
                                                 f"₹{total_invested_with_fees:.2f}",
-                                                f"Order filled on the exchange but the bot failed to record the position ({bookkeeping_error}). It will NOT be monitored or stop-loss protected until you check the exchange and fix this manually.",
+                                                f"Filled on exchange but bot bookkeeping failed: {bookkeeping_error}. Fix manually.",
                                                 "Critical")
                         else:
                             err = res.get("error", "API Error")
                             self.log_trade("BUY FAILED", best_candidate_coin, formatted_qty, f"₹{actual_cost:.2f}", f"Rejected: {err}", "Error")
                 except Exception as e:
-                    self.log_trade("BUY FAILED", best_candidate_coin, "0", "₹0.00", f"Entry execution error: {str(e)}", "Error")
-            else:
-                if rejected_by_macro:
-                    coins = f"{len(rejected_by_macro)} assets" if len(rejected_by_macro) > 4 else ", ".join(rejected_by_macro)
-                    self.log_trade("MACRO REJECT", "ALL", "0", "₹0.00", f"Assets {coins} are trading below 1H 200 EMA.", "Filter Active")
-                elif rejected_by_adx:
-                    coins = f"{len(rejected_by_adx)} assets" if len(rejected_by_adx) > 4 else ", ".join(rejected_by_adx)
-                    self.log_trade("MOMENTUM REJECT", "ALL", "0", "₹0.00", f"Assets {coins} have ADX < 25 (Chop / Weak Trend).", "Filter Active")
-                elif rejected_by_vol:
-                    coins = f"{len(rejected_by_vol)} assets" if len(rejected_by_vol) > 4 else ", ".join(rejected_by_vol)
-                    self.log_trade("VOLUME REJECT", "ALL", "0", "₹0.00", f"Assets {coins} lack 1.5x volume surge.", "Filter Active")
-                else:
-                    self.log_trade("SCAN SKIPPED", "ALL", "0", "₹0.00", "No explosive setups found.", "Standby")
+                    self.log_trade("BUY FAILED", best_candidate_coin, "0", "₹0.00", f"Execution error: {str(e)}", "Error")
 
-# Cache Buster v67
+# Cache Buster vFinal
 @st.cache_resource
-def get_bot_engine_v67():
+def get_bot_engine_vFinal():
     return GlobalBotEngine()
 
-bot = get_bot_engine_v67()
+bot = get_bot_engine_vFinal()
 
 # ==========================================
 # 4. STREAMLIT UI CONFIG & STYLING
@@ -999,7 +949,7 @@ else:
     st.sidebar.markdown("""<div style="background: #fce8e6; border: 1px solid #fad2cf; border-radius: 8px; padding: 12px; color: #c5221f; font-weight: 600; font-size: 0.9rem; text-align: center;">🔴 ENGINE STOPPED</div>""", unsafe_allow_html=True)
 
 st.sidebar.markdown("<br>", unsafe_allow_html=True)
-st.sidebar.caption("Version 67.0 (Python-Dominant Swing Trader)")
+st.sidebar.caption("Version 69.0 (Quant Architecture)")
 
 # ==========================================
 # 6. ROUTED PAGE VIEWS
@@ -1024,13 +974,13 @@ if page == "⚙️ Bot Engine & Settings":
                 "Top Coins Limit (By Volume)", 
                 min_value=1, max_value=20, 
                 value=5 if bot.auto_top_n == 0 else bot.auto_top_n,
-                help="Automatically scans CoinDCX for the highest 24-hour volume INR pairs (excluding stablecoins)."
+                help="Automatically scans CoinDCX for the highest 24-hour volume INR pairs."
             )
             candidate_input = ""
             
     with col2:
-        timeframes = ["1m", "15m", "1h", "1d"]
-        default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 1
+        timeframes = ["15m", "30m", "1h", "1d"]
+        default_idx = timeframes.index(bot.candle_interval) if bot.candle_interval in timeframes else 2
         candle_interval = st.selectbox(
             "Candle Timeframe (Trigger Execution)", 
             timeframes, index=default_idx
@@ -1051,16 +1001,16 @@ if page == "⚙️ Bot Engine & Settings":
         max_position_pct = st.slider(
             "Max Capital Per Single Trade (%)", min_value=10, max_value=100,
             value=int(bot.max_position_pct), step=5,
-            help="Caps how much of your Max Capital Strike can go into one coin at once. 100% = old all-in behavior. Lower this to diversify across multiple concurrent setups."
+            help="Caps how much of your Max Capital Strike can go into one coin at once."
         )
     with colE:
         daily_loss_limit_pct = st.slider(
             "Daily Loss Kill-Switch (% of budget)", min_value=0, max_value=50,
             value=int(bot.daily_loss_limit_pct), step=5,
-            help="If today's realized losses reach this % of your Max Capital Strike, the bot stops opening new positions until the next day (IST). 0 = disabled."
+            help="If today's realized losses reach this %, the bot stops opening new positions until tomorrow."
         )
 
-    st.info(f"🛡️ **Tax Shield Active:** The bot will size up to **₹{max_bud * max_position_pct / 100.0:.2f}** ({max_position_pct}% of budget) per trade. Exits are handled 100% mechanically by Python to prevent LLM latency delays.", icon="🎯")
+    st.info(f"🛡️ **Tax Shield Active:** The bot will size up to **₹{max_bud * max_position_pct / 100.0:.2f}** ({max_position_pct}% of budget) per trade. Exits are handled 100% mechanically by Python.", icon="🎯")
     st.markdown('</div>', unsafe_allow_html=True)
 
     ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
@@ -1144,6 +1094,7 @@ if page == "⚙️ Bot Engine & Settings":
         else:
             ist_offset = timedelta(hours=5, minutes=30)
             formatted_logs = []
+            # ✨ FIX 5: Iterate safely on the UI Thread
             for entry in list(bot.trade_log):
                 e = entry.copy()
                 if "timestamp" in e:
@@ -1204,7 +1155,9 @@ elif page == "📊 Live Dashboard":
             "all_time": {"profit": 0.0, "loss": 0.0, "count": 0}
         }
 
-        for trade in bot.completed_trades:
+        # ✨ FIX 5: Iterate safely on the UI Thread
+        safe_trades = list(bot.completed_trades)
+        for trade in safe_trades:
             trade_dt_ist = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset
             trade_date = trade_dt_ist.date()
             
@@ -1235,7 +1188,7 @@ elif page == "📊 Live Dashboard":
                     else: period_stats["last_month"]["loss"] += abs(net_pnl)
                     period_stats["last_month"]["count"] += 1
 
-        current_invested = sum(p['invested'] for p in list(bot.active_positions.values()))
+        current_invested = sum(pos['invested'] for coin, pos in list(bot.active_positions.items()))
         unrealized_net_pnl = 0.0
         
         for coin, pos in list(bot.active_positions.items()):
@@ -1328,7 +1281,8 @@ elif page == "📊 Live Dashboard":
             st.caption("No completed trades recorded in history file yet.")
         else:
             history_rows = []
-            for trade in reversed(bot.completed_trades):
+            # ✨ FIX 5: Iterate safely on the UI Thread
+            for trade in reversed(list(bot.completed_trades)):
                 t_dt = (datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc) + ist_offset).strftime("%Y-%m-%d %I:%M:%S %p")
                 history_rows.append({
                     "Date & Time": t_dt,
